@@ -1,4 +1,4 @@
-"""Configuration management for arr suite MCP server."""
+"""Configuration management for the curated Arr MCP server."""
 
 from typing import Optional
 from pydantic import Field
@@ -48,63 +48,19 @@ class ProwlarrConfig(ArrServiceConfig):
     model_config = SettingsConfigDict(env_prefix="PROWLARR_")
 
 
-class BazarrConfig(ArrServiceConfig):
-    """Bazarr-specific configuration."""
-
-    port: int = Field(default=6767)
-
-    model_config = SettingsConfigDict(env_prefix="BAZARR_")
-
-
-class OverseerrConfig(ArrServiceConfig):
-    """Overseerr-specific configuration."""
-
-    port: int = Field(default=5055)
-
-    model_config = SettingsConfigDict(env_prefix="OVERSEERR_")
-
-
-class JackettConfig(ArrServiceConfig):
-    """Jackett-specific configuration."""
-
-    port: int = Field(default=9117)
-
-    model_config = SettingsConfigDict(env_prefix="JACKETT_")
-
-
-class PlexConfig(BaseSettings):
-    """Plex Media Server configuration."""
-
-    host: str = Field(default="localhost", description="Plex server host address")
-    port: int = Field(default=32400, description="Plex server port")
-    token: str = Field(description="Plex authentication token")
-    ssl: bool = Field(default=False, description="Use HTTPS")
-
-    model_config = SettingsConfigDict(env_prefix="PLEX_")
-
-    @property
-    def base_url(self) -> str:
-        """Construct the base URL for Plex."""
-        protocol = "https" if self.ssl else "http"
-        return f"{protocol}://{self.host}:{self.port}"
-
-
 class ArrSuiteConfig(BaseSettings):
-    """Main configuration for the arr suite MCP server."""
+    """Main configuration for the curated Arr MCP server."""
 
     # Service configurations
     sonarr: Optional[SonarrConfig] = None
     radarr: Optional[RadarrConfig] = None
     prowlarr: Optional[ProwlarrConfig] = None
-    bazarr: Optional[BazarrConfig] = None
-    overseerr: Optional[OverseerrConfig] = None
-    jackett: Optional[JackettConfig] = None
-    plex: Optional[PlexConfig] = None
 
     # Global settings
     request_timeout: int = Field(default=30, description="API request timeout in seconds")
     max_retries: int = Field(default=3, description="Maximum number of retry attempts")
     log_level: str = Field(default="INFO", description="Logging level")
+    mcp_http_path: str = Field(default="/mcp", description="HTTP path exposed by supergateway")
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -133,26 +89,6 @@ class ArrSuiteConfig(BaseSettings):
         except Exception:
             pass
 
-        try:
-            self.bazarr = BazarrConfig()
-        except Exception:
-            pass
-
-        try:
-            self.overseerr = OverseerrConfig()
-        except Exception:
-            pass
-
-        try:
-            self.jackett = JackettConfig()
-        except Exception:
-            pass
-
-        try:
-            self.plex = PlexConfig()
-        except Exception:
-            pass
-
     @property
     def enabled_services(self) -> list[str]:
         """Return list of enabled services."""
@@ -163,12 +99,4 @@ class ArrSuiteConfig(BaseSettings):
             services.append("radarr")
         if self.prowlarr and self.prowlarr.api_key:
             services.append("prowlarr")
-        if self.bazarr and self.bazarr.api_key:
-            services.append("bazarr")
-        if self.overseerr and self.overseerr.api_key:
-            services.append("overseerr")
-        if self.jackett and self.jackett.api_key:
-            services.append("jackett")
-        if self.plex and self.plex.token:
-            services.append("plex")
         return services

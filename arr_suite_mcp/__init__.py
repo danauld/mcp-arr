@@ -1,3 +1,3 @@
-"""Arr Suite MCP Server - Comprehensive MCP integration for the arr suite."""
+"""Curated MCP integration for Sonarr, Radarr, and Prowlarr."""
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"

@@ -1,54 +1,82 @@
-"""Main MCP server implementation for arr suite."""
+"""Main MCP server implementation for the curated Arr service set."""
 
-import logging
+from __future__ import annotations
+
 import asyncio
-from typing import Any, Optional
-from mcp.server import Server
-from mcp.types import Tool, TextContent, ImageContent, EmbeddedResource
+import json
+import logging
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Optional
 
+from mcp.server import Server
+from mcp.types import TextContent, Tool
+
+from .clients import ArrClientError, ProwlarrClient, RadarrClient, SonarrClient
 from .config import ArrSuiteConfig
-from .clients import (
-    SonarrClient,
-    RadarrClient,
-    ProwlarrClient,
-    BazarrClient,
-    OverseerrClient,
-    PlexClient,
-    ArrClientError
-)
-from .routers import IntentRouter, ArrIntent
+from .routers import IntentRouter
 from .routers.intent_router import ArrService, OperationType
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+ToolHandler = Callable[[dict[str, Any]], Awaitable[Any]]
+
+
+@dataclass(slots=True)
+class ToolSpec:
+    """Definition for an MCP tool and its execution metadata."""
+
+    name: str
+    description: str
+    input_schema: dict[str, Any]
+    handler: ToolHandler
+    service: Optional[str] = None
+    operation: Optional[str] = None
+
+
+@dataclass(slots=True)
+class ToolInvocationError(Exception):
+    """Structured error raised by server-side tool helpers."""
+
+    message: str
+    service: Optional[str] = None
+    operation: Optional[str] = None
+    http_status: Optional[int] = None
+    details: Optional[dict[str, Any]] = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
 class ArrSuiteMCPServer:
-    """MCP Server for the arr suite with intelligent routing."""
+    """Curated MCP server for Sonarr, Radarr, and Prowlarr."""
+
+    SUPPORTED_SERVICES = ("sonarr", "radarr", "prowlarr")
 
     def __init__(self, config: Optional[ArrSuiteConfig] = None):
         """Initialize the MCP server."""
         self.config = config or ArrSuiteConfig()
-        self.server = Server("arr-suite-mcp")
+        self.server = Server("mcp-arr")
         self.router = IntentRouter()
-
-        # Initialize clients
         self.clients: dict[str, Any] = {}
-        self._initialize_clients()
+        self.tool_specs: dict[str, ToolSpec] = {}
 
-        # Register MCP handlers
+        self._initialize_clients()
+        self._register_tool_specs()
         self._register_handlers()
 
-        logger.info(f"Arr Suite MCP Server initialized with services: {self.config.enabled_services}")
+        logger.info("Enabled services: %s", ", ".join(self.clients) or "none")
+        logger.info("Registered tools: %s", ", ".join(self.get_registered_tool_names()))
 
     def _initialize_clients(self) -> None:
-        """Initialize API clients for enabled services."""
+        """Initialize API clients for the supported services."""
         if self.config.sonarr and self.config.sonarr.api_key:
             self.clients["sonarr"] = SonarrClient(
                 base_url=self.config.sonarr.base_url,
                 api_key=self.config.sonarr.api_key,
                 timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
+                max_retries=self.config.max_retries,
             )
 
         if self.config.radarr and self.config.radarr.api_key:
@@ -56,7 +84,7 @@ class ArrSuiteMCPServer:
                 base_url=self.config.radarr.base_url,
                 api_key=self.config.radarr.api_key,
                 timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
+                max_retries=self.config.max_retries,
             )
 
         if self.config.prowlarr and self.config.prowlarr.api_key:
@@ -64,621 +92,977 @@ class ArrSuiteMCPServer:
                 base_url=self.config.prowlarr.base_url,
                 api_key=self.config.prowlarr.api_key,
                 timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
+                max_retries=self.config.max_retries,
             )
 
-        if self.config.bazarr and self.config.bazarr.api_key:
-            self.clients["bazarr"] = BazarrClient(
-                base_url=self.config.bazarr.base_url,
-                api_key=self.config.bazarr.api_key,
-                timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
-            )
+    def _register_tool_specs(self) -> None:
+        """Register the curated tool surface exposed by the server."""
+        self._add_tool(
+            "arr_execute",
+            (
+                "Execute a supported Arr operation using natural language. "
+                "Routes only within the curated Sonarr, Radarr, and Prowlarr tool surface."
+            ),
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language query describing what you want to do",
+                    }
+                },
+                "required": ["query"],
+            },
+            self._tool_arr_execute,
+        )
+        self._add_tool(
+            "arr_explain_intent",
+            "Explain how a natural language query would be interpreted and which curated tool it maps to.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language query to explain",
+                    }
+                },
+                "required": ["query"],
+            },
+            self._tool_arr_explain_intent,
+        )
+        self._add_tool(
+            "arr_list_services",
+            "List the supported Arr services and whether each one is configured.",
+            {"type": "object", "properties": {}},
+            self._tool_arr_list_services,
+        )
+        self._add_tool(
+            "arr_get_system_status",
+            "Get system status for each configured Arr service.",
+            {"type": "object", "properties": {}},
+            self._tool_arr_get_system_status,
+        )
 
-        if self.config.overseerr and self.config.overseerr.api_key:
-            self.clients["overseerr"] = OverseerrClient(
-                base_url=self.config.overseerr.base_url,
-                api_key=self.config.overseerr.api_key,
-                timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
-            )
+        if "sonarr" in self.clients:
+            self._register_sonarr_tools()
+        if "radarr" in self.clients:
+            self._register_radarr_tools()
+        if "prowlarr" in self.clients:
+            self._register_prowlarr_tools()
 
-        if self.config.plex and self.config.plex.token:
-            self.clients["plex"] = PlexClient(
-                base_url=self.config.plex.base_url,
-                token=self.config.plex.token,
-                timeout=self.config.request_timeout,
-                max_retries=self.config.max_retries
-            )
+    def _register_sonarr_tools(self) -> None:
+        """Register Sonarr tools."""
+        self._add_tool(
+            "sonarr_search_series",
+            "Search for TV series in Sonarr.",
+            {
+                "type": "object",
+                "properties": {"term": {"type": "string", "description": "Search term"}},
+                "required": ["term"],
+            },
+            self._tool_sonarr_search_series,
+            service="sonarr",
+            operation="lookup_series",
+        )
+        self._add_tool(
+            "sonarr_add_series",
+            "Add a new TV series to Sonarr.",
+            {
+                "type": "object",
+                "properties": {
+                    "tvdb_id": {"type": "integer", "description": "TVDB ID"},
+                    "quality_profile_id": {
+                        "type": "integer",
+                        "description": "Quality profile ID",
+                    },
+                    "root_folder_path": {
+                        "type": "string",
+                        "description": "Root folder path",
+                    },
+                    "monitored": {
+                        "type": "boolean",
+                        "description": "Monitor series",
+                        "default": True,
+                    },
+                },
+                "required": ["tvdb_id", "quality_profile_id", "root_folder_path"],
+            },
+            self._tool_sonarr_add_series,
+            service="sonarr",
+            operation="add_series",
+        )
+        self._add_tool(
+            "sonarr_get_series",
+            "Get all series or a specific series.",
+            {
+                "type": "object",
+                "properties": {
+                    "series_id": {
+                        "type": "integer",
+                        "description": "Optional series ID",
+                    }
+                },
+            },
+            self._tool_sonarr_get_series,
+            service="sonarr",
+            operation="get_series",
+        )
+        self._add_tool(
+            "sonarr_get_calendar",
+            "Get upcoming episodes from Sonarr's calendar.",
+            {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "Optional ISO start date"},
+                    "end": {"type": "string", "description": "Optional ISO end date"},
+                },
+            },
+            self._tool_sonarr_get_calendar,
+            service="sonarr",
+            operation="get_calendar",
+        )
+        self._add_tool(
+            "sonarr_get_queue",
+            "Get Sonarr's download queue.",
+            {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "default": 1},
+                    "page_size": {"type": "integer", "default": 20},
+                    "include_unknown_series": {"type": "boolean", "default": False},
+                },
+            },
+            self._tool_sonarr_get_queue,
+            service="sonarr",
+            operation="get_queue",
+        )
+        self._add_tool(
+            "sonarr_get_history",
+            "Get Sonarr download/import history.",
+            {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "default": 1},
+                    "page_size": {"type": "integer", "default": 20},
+                    "series_id": {"type": "integer"},
+                    "event_type": {"type": "string"},
+                },
+            },
+            self._tool_sonarr_get_history,
+            service="sonarr",
+            operation="get_history",
+        )
+        self._add_tool(
+            "sonarr_get_root_folders",
+            "Get Sonarr root folders.",
+            {"type": "object", "properties": {}},
+            self._tool_sonarr_get_root_folders,
+            service="sonarr",
+            operation="get_root_folders",
+        )
+        self._add_tool(
+            "sonarr_get_quality_profiles",
+            "Get Sonarr quality profiles.",
+            {"type": "object", "properties": {}},
+            self._tool_sonarr_get_quality_profiles,
+            service="sonarr",
+            operation="get_quality_profiles",
+        )
+        self._add_tool(
+            "sonarr_get_episodes",
+            "Get episodes for a specific Sonarr series.",
+            {
+                "type": "object",
+                "properties": {
+                    "series_id": {"type": "integer", "description": "Series ID"}
+                },
+                "required": ["series_id"],
+            },
+            self._tool_sonarr_get_episodes,
+            service="sonarr",
+            operation="get_episodes",
+        )
+        self._add_tool(
+            "sonarr_get_episode",
+            "Get a specific Sonarr episode by ID.",
+            {
+                "type": "object",
+                "properties": {
+                    "episode_id": {"type": "integer", "description": "Episode ID"}
+                },
+                "required": ["episode_id"],
+            },
+            self._tool_sonarr_get_episode,
+            service="sonarr",
+            operation="get_episode",
+        )
+        self._add_tool(
+            "sonarr_update_series",
+            "Update a Sonarr series by merging the provided fields into the current series payload.",
+            {
+                "type": "object",
+                "properties": {
+                    "series_id": {"type": "integer", "description": "Series ID"},
+                    "fields": {
+                        "type": "object",
+                        "description": "Field values to merge into the current series payload",
+                    },
+                },
+                "required": ["series_id", "fields"],
+            },
+            self._tool_sonarr_update_series,
+            service="sonarr",
+            operation="update_series",
+        )
+
+    def _register_radarr_tools(self) -> None:
+        """Register Radarr tools."""
+        self._add_tool(
+            "radarr_search_movie",
+            "Search for movies in Radarr.",
+            {
+                "type": "object",
+                "properties": {"term": {"type": "string", "description": "Search term"}},
+                "required": ["term"],
+            },
+            self._tool_radarr_search_movie,
+            service="radarr",
+            operation="lookup_movie",
+        )
+        self._add_tool(
+            "radarr_add_movie",
+            "Add a new movie to Radarr.",
+            {
+                "type": "object",
+                "properties": {
+                    "tmdb_id": {"type": "integer", "description": "TMDB ID"},
+                    "quality_profile_id": {
+                        "type": "integer",
+                        "description": "Quality profile ID",
+                    },
+                    "root_folder_path": {
+                        "type": "string",
+                        "description": "Root folder path",
+                    },
+                    "monitored": {
+                        "type": "boolean",
+                        "description": "Monitor movie",
+                        "default": True,
+                    },
+                },
+                "required": ["tmdb_id", "quality_profile_id", "root_folder_path"],
+            },
+            self._tool_radarr_add_movie,
+            service="radarr",
+            operation="add_movie",
+        )
+        self._add_tool(
+            "radarr_get_movies",
+            "Get all movies or a specific movie.",
+            {
+                "type": "object",
+                "properties": {
+                    "movie_id": {
+                        "type": "integer",
+                        "description": "Optional movie ID",
+                    }
+                },
+            },
+            self._tool_radarr_get_movies,
+            service="radarr",
+            operation="get_movies",
+        )
+        self._add_tool(
+            "radarr_get_calendar",
+            "Get upcoming movie releases from Radarr's calendar.",
+            {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "string", "description": "Optional ISO start date"},
+                    "end": {"type": "string", "description": "Optional ISO end date"},
+                },
+            },
+            self._tool_radarr_get_calendar,
+            service="radarr",
+            operation="get_calendar",
+        )
+        self._add_tool(
+            "radarr_get_queue",
+            "Get Radarr's download queue.",
+            {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "default": 1},
+                    "page_size": {"type": "integer", "default": 20},
+                    "include_unknown_movies": {"type": "boolean", "default": False},
+                },
+            },
+            self._tool_radarr_get_queue,
+            service="radarr",
+            operation="get_queue",
+        )
+        self._add_tool(
+            "radarr_get_history",
+            "Get Radarr download/import history.",
+            {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "default": 1},
+                    "page_size": {"type": "integer", "default": 20},
+                    "movie_id": {"type": "integer"},
+                    "event_type": {"type": "string"},
+                },
+            },
+            self._tool_radarr_get_history,
+            service="radarr",
+            operation="get_history",
+        )
+        self._add_tool(
+            "radarr_get_root_folders",
+            "Get Radarr root folders.",
+            {"type": "object", "properties": {}},
+            self._tool_radarr_get_root_folders,
+            service="radarr",
+            operation="get_root_folders",
+        )
+        self._add_tool(
+            "radarr_get_quality_profiles",
+            "Get Radarr quality profiles.",
+            {"type": "object", "properties": {}},
+            self._tool_radarr_get_quality_profiles,
+            service="radarr",
+            operation="get_quality_profiles",
+        )
+        self._add_tool(
+            "radarr_get_movie",
+            "Get a specific Radarr movie by ID.",
+            {
+                "type": "object",
+                "properties": {"movie_id": {"type": "integer", "description": "Movie ID"}},
+                "required": ["movie_id"],
+            },
+            self._tool_radarr_get_movie,
+            service="radarr",
+            operation="get_movie",
+        )
+        self._add_tool(
+            "radarr_lookup_movie",
+            "Look up a movie in Radarr without adding it.",
+            {
+                "type": "object",
+                "properties": {"term": {"type": "string", "description": "Search term"}},
+                "required": ["term"],
+            },
+            self._tool_radarr_lookup_movie,
+            service="radarr",
+            operation="lookup_movie",
+        )
+        self._add_tool(
+            "radarr_update_movie",
+            "Update a Radarr movie by merging the provided fields into the current movie payload.",
+            {
+                "type": "object",
+                "properties": {
+                    "movie_id": {"type": "integer", "description": "Movie ID"},
+                    "fields": {
+                        "type": "object",
+                        "description": "Field values to merge into the current movie payload",
+                    },
+                },
+                "required": ["movie_id", "fields"],
+            },
+            self._tool_radarr_update_movie,
+            service="radarr",
+            operation="update_movie",
+        )
+
+    def _register_prowlarr_tools(self) -> None:
+        """Register Prowlarr tools."""
+        self._add_tool(
+            "prowlarr_search",
+            "Search for releases across all Prowlarr indexers.",
+            {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "type": {
+                        "type": "string",
+                        "description": "Search type (search, tvsearch, movie)",
+                        "default": "search",
+                    },
+                },
+                "required": ["query"],
+            },
+            self._tool_prowlarr_search,
+            service="prowlarr",
+            operation="search",
+        )
+        self._add_tool(
+            "prowlarr_get_indexers",
+            "Get all configured Prowlarr indexers.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_get_indexers,
+            service="prowlarr",
+            operation="get_indexers",
+        )
+        self._add_tool(
+            "prowlarr_sync_apps",
+            "Sync indexers to all connected applications in Prowlarr.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_sync_apps,
+            service="prowlarr",
+            operation="sync_apps",
+        )
+        self._add_tool(
+            "prowlarr_get_applications",
+            "Get all connected applications from Prowlarr.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_get_applications,
+            service="prowlarr",
+            operation="get_applications",
+        )
+        self._add_tool(
+            "prowlarr_get_download_clients",
+            "Get all configured download clients from Prowlarr.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_get_download_clients,
+            service="prowlarr",
+            operation="get_download_clients",
+        )
+        self._add_tool(
+            "prowlarr_test_indexer",
+            "Test a specific Prowlarr indexer by ID.",
+            {
+                "type": "object",
+                "properties": {
+                    "indexer_id": {"type": "integer", "description": "Indexer ID"}
+                },
+                "required": ["indexer_id"],
+            },
+            self._tool_prowlarr_test_indexer,
+            service="prowlarr",
+            operation="test_indexer",
+        )
+        self._add_tool(
+            "prowlarr_test_all_indexers",
+            "Test all configured Prowlarr indexers.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_test_all_indexers,
+            service="prowlarr",
+            operation="test_all_indexers",
+        )
+        self._add_tool(
+            "prowlarr_get_tags",
+            "Get all Prowlarr tags.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_get_tags,
+            service="prowlarr",
+            operation="get_tags",
+        )
+        self._add_tool(
+            "prowlarr_get_system_health",
+            "Get Prowlarr health warnings and system health details.",
+            {"type": "object", "properties": {}},
+            self._tool_prowlarr_get_system_health,
+            service="prowlarr",
+            operation="get_system_health",
+        )
+
+    def _add_tool(
+        self,
+        name: str,
+        description: str,
+        input_schema: dict[str, Any],
+        handler: ToolHandler,
+        *,
+        service: Optional[str] = None,
+        operation: Optional[str] = None,
+    ) -> None:
+        """Register a tool specification."""
+        self.tool_specs[name] = ToolSpec(
+            name=name,
+            description=description,
+            input_schema=input_schema,
+            handler=handler,
+            service=service,
+            operation=operation,
+        )
 
     def _register_handlers(self) -> None:
         """Register MCP protocol handlers."""
 
         @self.server.list_tools()
         async def list_tools() -> list[Tool]:
-            """List available MCP tools."""
-            tools = [
+            return [
                 Tool(
-                    name="arr_execute",
-                    description=(
-                        "Execute arr suite operations using natural language. "
-                        "Intelligently routes to the correct service (Sonarr, Radarr, "
-                        "Prowlarr, Bazarr, or Overseerr) based on your request. "
-                        "Examples: 'add Breaking Bad', 'search for The Matrix', "
-                        "'download English subtitles for Dune', 'list all indexers', "
-                        "'request Inception'"
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Natural language query describing what you want to do"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                Tool(
-                    name="arr_explain_intent",
-                    description=(
-                        "Explain how a natural language query would be interpreted "
-                        "and routed to arr services. Useful for understanding what "
-                        "the system will do before executing."
-                    ),
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "query": {
-                                "type": "string",
-                                "description": "Natural language query to explain"
-                            }
-                        },
-                        "required": ["query"]
-                    }
-                ),
-                Tool(
-                    name="arr_list_services",
-                    description="List all configured and available arr services",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {}
-                    }
-                ),
-                Tool(
-                    name="arr_get_system_status",
-                    description="Get system status for all configured arr services",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {}
-                    }
-                ),
+                    name=spec.name,
+                    description=spec.description,
+                    inputSchema=spec.input_schema,
+                )
+                for spec in self.tool_specs.values()
             ]
 
-            # Add service-specific tools
-            if "sonarr" in self.clients:
-                tools.extend(self._get_sonarr_tools())
-            if "radarr" in self.clients:
-                tools.extend(self._get_radarr_tools())
-            if "prowlarr" in self.clients:
-                tools.extend(self._get_prowlarr_tools())
-            if "bazarr" in self.clients:
-                tools.extend(self._get_bazarr_tools())
-            if "overseerr" in self.clients:
-                tools.extend(self._get_overseerr_tools())
-            if "plex" in self.clients:
-                tools.extend(self._get_plex_tools())
-
-            return tools
-
         @self.server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-            """Handle tool calls."""
-            try:
-                # Route to appropriate handler
-                if name == "arr_execute":
-                    result = await self._handle_arr_execute(arguments["query"])
-                elif name == "arr_explain_intent":
-                    result = self._handle_explain_intent(arguments["query"])
-                elif name == "arr_list_services":
-                    result = self._handle_list_services()
-                elif name == "arr_get_system_status":
-                    result = await self._handle_system_status()
-                # Service-specific tools
-                elif name.startswith("sonarr_"):
-                    result = await self._handle_sonarr_tool(name, arguments)
-                elif name.startswith("radarr_"):
-                    result = await self._handle_radarr_tool(name, arguments)
-                elif name.startswith("prowlarr_"):
-                    result = await self._handle_prowlarr_tool(name, arguments)
-                elif name.startswith("bazarr_"):
-                    result = await self._handle_bazarr_tool(name, arguments)
-                elif name.startswith("overseerr_"):
-                    result = await self._handle_overseerr_tool(name, arguments)
-                elif name.startswith("plex_"):
-                    result = await self._handle_plex_tool(name, arguments)
-                else:
-                    result = {"error": f"Unknown tool: {name}"}
+        async def call_tool(name: str, arguments: Optional[dict[str, Any]]) -> list[TextContent]:
+            payload = await self.dispatch_tool(name, arguments or {})
+            return [TextContent(type="text", text=self._serialize_payload(payload))]
 
-                return [TextContent(type="text", text=str(result))]
+    async def dispatch_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Dispatch a tool call and always return a structured payload."""
+        spec = self.tool_specs.get(name)
+        if spec is None:
+            return self._error_payload(
+                service=None,
+                operation=name,
+                message=f"Unknown tool: {name}",
+                details={"available_tools": self.get_registered_tool_names()},
+            )
 
-            except Exception as e:
-                logger.error(f"Error handling tool {name}: {e}", exc_info=True)
-                return [TextContent(
-                    type="text",
-                    text=f"Error: {str(e)}"
-                )]
-
-    def _get_sonarr_tools(self) -> list[Tool]:
-        """Get Sonarr-specific tools."""
-        return [
-            Tool(
-                name="sonarr_search_series",
-                description="Search for TV series in Sonarr",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "term": {"type": "string", "description": "Search term"}
-                    },
-                    "required": ["term"]
-                }
-            ),
-            Tool(
-                name="sonarr_add_series",
-                description="Add a new TV series to Sonarr",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "tvdb_id": {"type": "integer", "description": "TVDB ID"},
-                        "quality_profile_id": {"type": "integer", "description": "Quality profile ID"},
-                        "root_folder_path": {"type": "string", "description": "Root folder path"},
-                        "monitored": {"type": "boolean", "description": "Monitor series", "default": True}
-                    },
-                    "required": ["tvdb_id", "quality_profile_id", "root_folder_path"]
-                }
-            ),
-            Tool(
-                name="sonarr_get_series",
-                description="Get all series or a specific series",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "series_id": {"type": "integer", "description": "Optional series ID"}
-                    }
-                }
-            ),
-        ]
-
-    def _get_radarr_tools(self) -> list[Tool]:
-        """Get Radarr-specific tools."""
-        return [
-            Tool(
-                name="radarr_search_movie",
-                description="Search for movies in Radarr",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "term": {"type": "string", "description": "Search term"}
-                    },
-                    "required": ["term"]
-                }
-            ),
-            Tool(
-                name="radarr_add_movie",
-                description="Add a new movie to Radarr",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "tmdb_id": {"type": "integer", "description": "TMDB ID"},
-                        "quality_profile_id": {"type": "integer", "description": "Quality profile ID"},
-                        "root_folder_path": {"type": "string", "description": "Root folder path"},
-                        "monitored": {"type": "boolean", "description": "Monitor movie", "default": True}
-                    },
-                    "required": ["tmdb_id", "quality_profile_id", "root_folder_path"]
-                }
-            ),
-            Tool(
-                name="radarr_get_movies",
-                description="Get all movies or a specific movie",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "movie_id": {"type": "integer", "description": "Optional movie ID"}
-                    }
-                }
-            ),
-        ]
-
-    def _get_prowlarr_tools(self) -> list[Tool]:
-        """Get Prowlarr-specific tools."""
-        return [
-            Tool(
-                name="prowlarr_search",
-                description="Search for releases across all indexers",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"},
-                        "type": {"type": "string", "description": "Search type (search, tvsearch, movie)", "default": "search"}
-                    },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="prowlarr_get_indexers",
-                description="Get all configured indexers",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="prowlarr_sync_apps",
-                description="Sync indexers to all connected applications",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-        ]
-
-    def _get_bazarr_tools(self) -> list[Tool]:
-        """Get Bazarr-specific tools."""
-        return [
-            Tool(
-                name="bazarr_search_subtitles",
-                description="Search for subtitles for a movie or episode",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "media_type": {"type": "string", "description": "movie or series"},
-                        "media_id": {"type": "integer", "description": "Media ID"},
-                        "episode_id": {"type": "integer", "description": "Episode ID (for series)"}
-                    },
-                    "required": ["media_type", "media_id"]
-                }
-            ),
-            Tool(
-                name="bazarr_download_subtitle",
-                description="Download a subtitle",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "media_type": {"type": "string", "description": "movie or episode"},
-                        "media_id": {"type": "integer"},
-                        "language": {"type": "string", "description": "Language code (e.g., 'en')"}
-                    },
-                    "required": ["media_type", "media_id", "language"]
-                }
-            ),
-        ]
-
-    def _get_overseerr_tools(self) -> list[Tool]:
-        """Get Overseerr-specific tools."""
-        return [
-            Tool(
-                name="overseerr_search",
-                description="Search for movies and TV shows",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"}
-                    },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="overseerr_request",
-                description="Request a movie or TV show",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "media_type": {"type": "string", "description": "movie or tv"},
-                        "media_id": {"type": "integer", "description": "TMDB/TVDB ID"},
-                        "is_4k": {"type": "boolean", "default": False}
-                    },
-                    "required": ["media_type", "media_id"]
-                }
-            ),
-            Tool(
-                name="overseerr_get_requests",
-                description="Get all media requests",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "filter": {"type": "string", "description": "Filter (pending, approved, available)"}
-                    }
-                }
-            ),
-        ]
-
-    async def _handle_arr_execute(self, query: str) -> dict[str, Any]:
-        """Handle natural language arr execution."""
-        # Parse intent
-        service, operation, context = self.router.route(query)
-
-        # Check if service is available
-        if service.value not in self.clients:
-            return {
-                "error": f"{service.value.capitalize()} is not configured",
-                "available_services": list(self.clients.keys())
-            }
-
-        client = self.clients[service.value]
-
-        # Execute operation based on service and operation type
         try:
-            result = await self._execute_operation(client, service, operation, context)
+            result = await spec.handler(arguments)
             return {
-                "service": service.value,
-                "operation": operation.value,
-                "result": result
+                "ok": True,
+                "tool": name,
+                "service": spec.service,
+                "operation": spec.operation,
+                "data": result,
             }
-        except ArrClientError as e:
-            return {
-                "error": str(e),
-                "service": service.value,
-                "operation": operation.value
-            }
+        except ArrClientError as exc:
+            return self._error_payload(
+                service=spec.service,
+                operation=spec.operation or name,
+                message=exc.message,
+                http_status=exc.http_status,
+                details=exc.details,
+                tool=name,
+            )
+        except ToolInvocationError as exc:
+            return self._error_payload(
+                service=exc.service or spec.service,
+                operation=exc.operation or spec.operation or name,
+                message=exc.message,
+                http_status=exc.http_status,
+                details=exc.details,
+                tool=name,
+            )
+        except Exception as exc:  # noqa: BLE001 - normalized for MCP response
+            logger.error("Error handling tool %s", name, exc_info=True)
+            return self._error_payload(
+                service=spec.service,
+                operation=spec.operation or name,
+                message=str(exc),
+                details={"arguments": arguments},
+                tool=name,
+            )
 
-    async def _execute_operation(
-        self,
-        client: Any,
-        service: ArrService,
-        operation: OperationType,
-        context: dict
-    ) -> Any:
-        """Execute the appropriate operation on the client."""
-        # This is a simplified implementation - you would expand this
-        # with more sophisticated routing logic
+    def get_registered_tool_names(self) -> list[str]:
+        """Return the registered tool names in declaration order."""
+        return list(self.tool_specs.keys())
 
-        if service == ArrService.SONARR:
-            if operation == OperationType.SEARCH:
-                term = context.get("title", "")
-                return await client.lookup_series(term)
-            elif operation == OperationType.LIST:
-                return await client.get_all_series()
-
-        elif service == ArrService.RADARR:
-            if operation == OperationType.SEARCH:
-                term = context.get("title", "")
-                return await client.lookup_movie(term)
-            elif operation == OperationType.LIST:
-                return await client.get_all_movies()
-
-        elif service == ArrService.PROWLARR:
-            if operation == OperationType.SEARCH:
-                query = context.get("title", "")
-                return await client.search(query)
-            elif operation == OperationType.LIST:
-                return await client.get_all_indexers()
-
-        elif service == ArrService.OVERSEERR:
-            if operation == OperationType.SEARCH:
-                query = context.get("title", "")
-                return await client.search_media(query)
-            elif operation == OperationType.REQUEST:
-                # Would need more context to execute
-                return {"message": "Please use overseerr_request tool with media_type and media_id"}
-
-        elif service == ArrService.PLEX:
-            if operation == OperationType.SEARCH:
-                query = context.get("title", "")
-                return await client.search(query)
-            elif operation == OperationType.LIST or operation == OperationType.GET:
-                return await client.get_libraries()
-            elif operation == OperationType.SCAN:
-                return {"message": "Please use plex_scan_library tool with section_id"}
-            elif operation == OperationType.PLAY:
-                return await client.get_sessions()
-            elif operation == OperationType.REFRESH:
-                return await client.get_recently_added()
-
-        return {"message": f"Operation {operation.value} not yet implemented for {service.value}"}
-
-    def _handle_explain_intent(self, query: str) -> dict[str, Any]:
-        """Explain how a query would be interpreted."""
-        explanation = self.router.explain_intent(query)
-        return {"explanation": explanation}
-
-    def _handle_list_services(self) -> dict[str, Any]:
-        """List all configured services."""
-        return {
-            "enabled_services": self.config.enabled_services,
-            "services": {
-                name: {
-                    "configured": name in self.clients,
-                    "url": getattr(self.config, name).base_url if hasattr(self.config, name) and getattr(self.config, name) else None
-                }
-                for name in ["sonarr", "radarr", "prowlarr", "bazarr", "overseerr"]
-            }
-        }
-
-    async def _handle_system_status(self) -> dict[str, Any]:
-        """Get system status for all services."""
-        statuses = {}
+    async def probe_services(self) -> dict[str, dict[str, Any]]:
+        """Probe each configured Arr service and return health details."""
+        statuses: dict[str, dict[str, Any]] = {}
         for name, client in self.clients.items():
             try:
                 status = await client.get_system_status()
-                statuses[name] = {
-                    "online": True,
-                    "status": status
-                }
-            except Exception as e:
+                statuses[name] = {"online": True, "status": status}
+            except ArrClientError as exc:
                 statuses[name] = {
                     "online": False,
-                    "error": str(e)
+                    "service": name,
+                    "http_status": exc.http_status,
+                    "message": exc.message,
+                    "details": exc.details,
+                }
+            except Exception as exc:  # noqa: BLE001 - health summary should not crash the server
+                statuses[name] = {
+                    "online": False,
+                    "service": name,
+                    "message": str(exc),
+                    "details": {},
                 }
         return statuses
 
-    async def _handle_sonarr_tool(self, name: str, arguments: dict) -> Any:
-        """Handle Sonarr-specific tools."""
-        client = self.clients["sonarr"]
+    async def close(self) -> None:
+        """Close all initialized API clients."""
+        for client in self.clients.values():
+            await client.close()
 
-        if name == "sonarr_search_series":
-            return await client.lookup_series(arguments["term"])
-        elif name == "sonarr_add_series":
-            return await client.add_series(**arguments)
-        elif name == "sonarr_get_series":
-            if "series_id" in arguments:
-                return await client.get_series(arguments["series_id"])
-            return await client.get_all_series()
+    async def _tool_arr_execute(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Execute a curated Arr operation from natural language."""
+        query = self._require_string(arguments, "query")
+        service, operation, context = self._resolve_curated_intent(query)
+        routed = self._route_intent_to_tool(service, operation)
 
-    async def _handle_radarr_tool(self, name: str, arguments: dict) -> Any:
-        """Handle Radarr-specific tools."""
-        client = self.clients["radarr"]
-
-        if name == "radarr_search_movie":
-            return await client.lookup_movie(arguments["term"])
-        elif name == "radarr_add_movie":
-            return await client.add_movie(**arguments)
-        elif name == "radarr_get_movies":
-            if "movie_id" in arguments:
-                return await client.get_movie(arguments["movie_id"])
-            return await client.get_all_movies()
-
-    async def _handle_prowlarr_tool(self, name: str, arguments: dict) -> Any:
-        """Handle Prowlarr-specific tools."""
-        client = self.clients["prowlarr"]
-
-        if name == "prowlarr_search":
-            return await client.search(**arguments)
-        elif name == "prowlarr_get_indexers":
-            return await client.get_all_indexers()
-        elif name == "prowlarr_sync_apps":
-            return await client.sync_all_applications()
-
-    async def _handle_bazarr_tool(self, name: str, arguments: dict) -> Any:
-        """Handle Bazarr-specific tools."""
-        client = self.clients["bazarr"]
-
-        if name == "bazarr_search_subtitles":
-            if arguments["media_type"] == "series":
-                return await client.search_series_subtitles(
-                    arguments["media_id"],
-                    arguments.get("episode_id")
-                )
-            return await client.search_movie_subtitles(arguments["media_id"])
-        elif name == "bazarr_download_subtitle":
-            if arguments["media_type"] == "episode":
-                return await client.download_series_subtitle(
-                    arguments["media_id"],
-                    arguments["language"]
-                )
-            return await client.download_movie_subtitle(
-                arguments["media_id"],
-                arguments["language"]
+        if service.value not in self.clients:
+            raise ToolInvocationError(
+                service=service.value,
+                operation=operation.value,
+                message=f"{service.value.capitalize()} is not configured",
+                details={"available_services": list(self.clients.keys())},
             )
 
-    async def _handle_overseerr_tool(self, name: str, arguments: dict) -> Any:
-        """Handle Overseerr-specific tools."""
-        client = self.clients["overseerr"]
+        if routed is None:
+            raise ToolInvocationError(
+                service=service.value,
+                operation=operation.value,
+                message=(
+                    "Natural language execution only supports the curated search, list, and sync flows "
+                    "for this phase. Use a service-specific tool for the full operation."
+                ),
+                details={
+                    "intent_context": context,
+                    "supported_tools": self.get_registered_tool_names(),
+                },
+            )
 
-        if name == "overseerr_search":
-            return await client.search_media(arguments["query"])
-        elif name == "overseerr_request":
-            return await client.create_request(**arguments)
-        elif name == "overseerr_get_requests":
-            return await client.get_requests(filter=arguments.get("filter"))
+        tool_name, routed_arguments = self._arguments_for_routed_tool(routed, query, context)
+        result = await self.dispatch_tool(tool_name, routed_arguments)
+        if not result.get("ok", False):
+            raise ToolInvocationError(
+                service=result.get("service") or service.value,
+                operation=result.get("operation") or operation.value,
+                http_status=result.get("http_status"),
+                message=result.get("message", "Natural language execution failed"),
+                details={
+                    "query": query,
+                    "intent_context": context,
+                    "routed_tool": tool_name,
+                    "routed_result": result,
+                },
+            )
+        return {
+            "query": query,
+            "service": service.value,
+            "operation": operation.value,
+            "intent_context": context,
+            "routed_tool": tool_name,
+            "result": result,
+        }
 
-    def _get_plex_tools(self) -> list[Tool]:
-        """Get Plex-specific tools."""
-        return [
-            Tool(
-                name="plex_get_libraries",
-                description="Get all Plex libraries",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="plex_search",
-                description="Search Plex for media",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query"}
-                    },
-                    "required": ["query"]
-                }
-            ),
-            Tool(
-                name="plex_get_recently_added",
-                description="Get recently added media",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "limit": {"type": "integer", "description": "Max items", "default": 50}
-                    }
-                }
-            ),
-            Tool(
-                name="plex_get_on_deck",
-                description="Get On Deck (in progress) media",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="plex_get_sessions",
-                description="Get currently playing sessions",
-                inputSchema={"type": "object", "properties": {}}
-            ),
-            Tool(
-                name="plex_scan_library",
-                description="Scan a Plex library for new content",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "section_id": {"type": "integer", "description": "Library section ID"}
-                    },
-                    "required": ["section_id"]
-                }
-            ),
-            Tool(
-                name="plex_mark_watched",
-                description="Mark media as watched",
-                inputSchema={
-                    "type": "object",
-                    "properties": {
-                        "rating_key": {"type": "string", "description": "Media rating key"}
-                    },
-                    "required": ["rating_key"]
-                }
-            ),
-        ]
+    async def _tool_arr_explain_intent(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Explain how the natural language query would be handled."""
+        query = self._require_string(arguments, "query")
+        raw_service, raw_operation, raw_context = self.router.route(query)
+        service, operation, context = self._resolve_curated_intent(query)
+        routed = self._route_intent_to_tool(service, operation)
+        return {
+            "query": query,
+            "service": service.value,
+            "operation": operation.value,
+            "intent_context": context,
+            "raw_router_service": raw_service.value,
+            "raw_router_operation": raw_operation.value,
+            "raw_router_context": raw_context,
+            "routed_tool": routed,
+            "supported": routed is not None,
+            "explanation": self.router.explain_intent(query),
+        }
 
-    async def _handle_plex_tool(self, name: str, arguments: dict) -> Any:
-        """Handle Plex-specific tools."""
-        client = self.clients["plex"]
+    async def _tool_arr_list_services(self, _: dict[str, Any]) -> dict[str, Any]:
+        """List supported services and their configuration state."""
+        service_configs = {
+            "sonarr": self.config.sonarr,
+            "radarr": self.config.radarr,
+            "prowlarr": self.config.prowlarr,
+        }
+        return {
+            "enabled_services": list(self.clients.keys()),
+            "services": {
+                name: {
+                    "configured": name in self.clients,
+                    "base_url": config.base_url if config else None,
+                }
+                for name, config in service_configs.items()
+            },
+            "registered_tools": self.get_registered_tool_names(),
+        }
 
-        if name == "plex_get_libraries":
-            return await client.get_libraries()
-        elif name == "plex_search":
-            return await client.search(arguments["query"])
-        elif name == "plex_get_recently_added":
-            return await client.get_recently_added(limit=arguments.get("limit", 50))
-        elif name == "plex_get_on_deck":
-            return await client.get_on_deck()
-        elif name == "plex_get_sessions":
-            return await client.get_sessions()
-        elif name == "plex_scan_library":
-            return await client.scan_library(arguments["section_id"])
-        elif name == "plex_mark_watched":
-            return await client.mark_watched(arguments["rating_key"])
+    async def _tool_arr_get_system_status(self, _: dict[str, Any]) -> dict[str, Any]:
+        """Return the current health and registration summary."""
+        return {
+            "enabled_services": list(self.clients.keys()),
+            "tool_count": len(self.tool_specs),
+            "registered_tools": self.get_registered_tool_names(),
+            "service_status": await self.probe_services(),
+        }
+
+    async def _tool_sonarr_search_series(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().lookup_series(self._require_string(arguments, "term"))
+
+    async def _tool_sonarr_add_series(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().add_series(**arguments)
+
+    async def _tool_sonarr_get_series(self, arguments: dict[str, Any]) -> Any:
+        client = self._get_sonarr()
+        series_id = arguments.get("series_id")
+        if series_id is None:
+            return await client.get_all_series()
+        return await client.get_series(int(series_id))
+
+    async def _tool_sonarr_get_calendar(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_calendar(
+            start=arguments.get("start"),
+            end=arguments.get("end"),
+        )
+
+    async def _tool_sonarr_get_queue(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_queue(
+            page=int(arguments.get("page", 1)),
+            page_size=int(arguments.get("page_size", 20)),
+            include_unknown_series=bool(arguments.get("include_unknown_series", False)),
+        )
+
+    async def _tool_sonarr_get_history(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_history(
+            page=int(arguments.get("page", 1)),
+            page_size=int(arguments.get("page_size", 20)),
+            series_id=arguments.get("series_id"),
+            event_type=arguments.get("event_type"),
+        )
+
+    async def _tool_sonarr_get_root_folders(self, _: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_root_folders()
+
+    async def _tool_sonarr_get_quality_profiles(self, _: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_quality_profiles()
+
+    async def _tool_sonarr_get_episodes(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_episodes(int(self._require(arguments, "series_id")))
+
+    async def _tool_sonarr_get_episode(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_episode(int(self._require(arguments, "episode_id")))
+
+    async def _tool_sonarr_update_series(self, arguments: dict[str, Any]) -> Any:
+        client = self._get_sonarr()
+        series_id = int(self._require(arguments, "series_id"))
+        fields = self._require_object(arguments, "fields")
+        series = await client.get_series(series_id)
+        series.update(fields)
+        return await client.update_series(series)
+
+    async def _tool_radarr_search_movie(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().lookup_movie(self._require_string(arguments, "term"))
+
+    async def _tool_radarr_add_movie(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().add_movie(**arguments)
+
+    async def _tool_radarr_get_movies(self, arguments: dict[str, Any]) -> Any:
+        client = self._get_radarr()
+        movie_id = arguments.get("movie_id")
+        if movie_id is None:
+            return await client.get_all_movies()
+        return await client.get_movie(int(movie_id))
+
+    async def _tool_radarr_get_calendar(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_calendar(
+            start=arguments.get("start"),
+            end=arguments.get("end"),
+        )
+
+    async def _tool_radarr_get_queue(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_queue(
+            page=int(arguments.get("page", 1)),
+            page_size=int(arguments.get("page_size", 20)),
+            include_unknown_movies=bool(arguments.get("include_unknown_movies", False)),
+        )
+
+    async def _tool_radarr_get_history(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_history(
+            page=int(arguments.get("page", 1)),
+            page_size=int(arguments.get("page_size", 20)),
+            movie_id=arguments.get("movie_id"),
+            event_type=arguments.get("event_type"),
+        )
+
+    async def _tool_radarr_get_root_folders(self, _: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_root_folders()
+
+    async def _tool_radarr_get_quality_profiles(self, _: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_quality_profiles()
+
+    async def _tool_radarr_get_movie(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_movie(int(self._require(arguments, "movie_id")))
+
+    async def _tool_radarr_lookup_movie(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().lookup_movie(self._require_string(arguments, "term"))
+
+    async def _tool_radarr_update_movie(self, arguments: dict[str, Any]) -> Any:
+        client = self._get_radarr()
+        movie_id = int(self._require(arguments, "movie_id"))
+        fields = self._require_object(arguments, "fields")
+        movie = await client.get_movie(movie_id)
+        movie.update(fields)
+        return await client.update_movie(movie)
+
+    async def _tool_prowlarr_search(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().search(
+            query=self._require_string(arguments, "query"),
+            type=arguments.get("type", "search"),
+        )
+
+    async def _tool_prowlarr_get_indexers(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().get_all_indexers()
+
+    async def _tool_prowlarr_sync_apps(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().sync_all_applications()
+
+    async def _tool_prowlarr_get_applications(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().get_applications()
+
+    async def _tool_prowlarr_get_download_clients(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().get_download_clients()
+
+    async def _tool_prowlarr_test_indexer(self, arguments: dict[str, Any]) -> Any:
+        client = self._get_prowlarr()
+        indexer_id = int(self._require(arguments, "indexer_id"))
+        indexer = await client.get_indexer(indexer_id)
+        return await client.test_indexer(indexer)
+
+    async def _tool_prowlarr_test_all_indexers(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().test_all_indexers()
+
+    async def _tool_prowlarr_get_tags(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().get_tags()
+
+    async def _tool_prowlarr_get_system_health(self, _: dict[str, Any]) -> Any:
+        return await self._get_prowlarr().get_system_health()
+
+    def _route_intent_to_tool(
+        self,
+        service: ArrService,
+        operation: OperationType,
+    ) -> Optional[str]:
+        """Route a natural-language intent to a curated tool name."""
+        route_map = {
+            (ArrService.SONARR, OperationType.SEARCH): "sonarr_search_series",
+            (ArrService.SONARR, OperationType.LIST): "sonarr_get_series",
+            (ArrService.RADARR, OperationType.SEARCH): "radarr_search_movie",
+            (ArrService.RADARR, OperationType.LIST): "radarr_get_movies",
+            (ArrService.PROWLARR, OperationType.SEARCH): "prowlarr_search",
+            (ArrService.PROWLARR, OperationType.LIST): "prowlarr_get_indexers",
+            (ArrService.PROWLARR, OperationType.SYNC): "prowlarr_sync_apps",
+        }
+        return route_map.get((service, operation))
+
+    def _resolve_curated_intent(
+        self,
+        query: str,
+    ) -> tuple[ArrService, OperationType, dict[str, Any]]:
+        """Resolve intent with a small curated override layer for exposed services."""
+        service, operation, context = self.router.route(query)
+        query_lower = query.lower()
+
+        if any(keyword in query_lower for keyword in ("indexer", "indexers", "tracker", "usenet")):
+            return ArrService.PROWLARR, operation, context
+
+        if any(
+            keyword in query_lower
+            for keyword in ("tv", "tv show", "tv shows", "series", "episode", "season", "anime")
+        ):
+            return ArrService.SONARR, operation, context
+
+        if any(
+            keyword in query_lower for keyword in ("movie", "movies", "film", "films", "cinema", "tmdb")
+        ):
+            return ArrService.RADARR, operation, context
+
+        if service.value in self.clients:
+            return service, operation, context
+
+        if operation == OperationType.SEARCH:
+            return ArrService.RADARR, operation, context
+
+        return service, operation, context
+
+    def _arguments_for_routed_tool(
+        self,
+        tool_name: str,
+        query: str,
+        context: dict[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        """Build tool arguments for the routed natural-language action."""
+        if tool_name in {"sonarr_search_series", "radarr_search_movie"}:
+            return tool_name, {"term": context.get("title") or query}
+        if tool_name == "prowlarr_search":
+            return tool_name, {"query": context.get("title") or query, "type": "search"}
+        return tool_name, {}
+
+    def _get_sonarr(self) -> SonarrClient:
+        return self.clients["sonarr"]
+
+    def _get_radarr(self) -> RadarrClient:
+        return self.clients["radarr"]
+
+    def _get_prowlarr(self) -> ProwlarrClient:
+        return self.clients["prowlarr"]
+
+    @staticmethod
+    def _require(arguments: dict[str, Any], key: str) -> Any:
+        """Require a key to be present in the tool arguments."""
+        if key not in arguments:
+            raise ValueError(f"Missing required argument: {key}")
+        return arguments[key]
+
+    @classmethod
+    def _require_string(cls, arguments: dict[str, Any], key: str) -> str:
+        """Require a non-empty string argument."""
+        value = cls._require(arguments, key)
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"Argument '{key}' must be a non-empty string")
+        return value.strip()
+
+    @classmethod
+    def _require_object(cls, arguments: dict[str, Any], key: str) -> dict[str, Any]:
+        """Require an object argument."""
+        value = cls._require(arguments, key)
+        if not isinstance(value, dict):
+            raise ValueError(f"Argument '{key}' must be an object")
+        return value
+
+    @staticmethod
+    def _error_payload(
+        *,
+        service: Optional[str],
+        operation: Optional[str],
+        message: str,
+        http_status: Optional[int] = None,
+        details: Optional[dict[str, Any]] = None,
+        tool: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Build the normalized error response shape."""
+        return {
+            "ok": False,
+            "tool": tool,
+            "service": service,
+            "operation": operation,
+            "http_status": http_status,
+            "message": message,
+            "details": details or {},
+        }
+
+    @staticmethod
+    def _serialize_payload(payload: dict[str, Any]) -> str:
+        """Serialize a payload into JSON text for the MCP response."""
+        return json.dumps(payload, indent=2, default=str)
 
     async def run(self) -> None:
-        """Run the MCP server."""
+        """Run the MCP server over stdio."""
         from mcp.server.stdio import stdio_server
 
         async with stdio_server() as (read_stream, write_stream):
             await self.server.run(
                 read_stream,
                 write_stream,
-                self.server.create_initialization_options()
+                self.server.create_initialization_options(),
             )
 
 
-def main():
+def main() -> None:
     """Main entry point."""
     import sys
 
-    # Load configuration
-    config = ArrSuiteConfig()
-
-    # Create and run server
-    server = ArrSuiteMCPServer(config)
-
+    server = ArrSuiteMCPServer(ArrSuiteConfig())
     try:
         asyncio.run(server.run())
     except KeyboardInterrupt:

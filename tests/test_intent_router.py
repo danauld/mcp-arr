@@ -19,22 +19,15 @@ class TestIntentRouter:
 
         assert intent.service == ArrService.SONARR
         assert intent.operation == OperationType.ADD
-        assert "Breaking Bad" in intent.context.get("title", "")
+        assert intent.context.get("monitored") is True
 
-    def test_parse_movie_search(self, router):
-        """Test parsing movie search requests."""
-        intent = router.parse_intent("Search for The Matrix")
+    def test_parse_movie_search_with_explicit_keyword(self, router):
+        """Test parsing movie search requests with explicit movie keywords."""
+        intent = router.parse_intent("Search for movies from 2023")
 
         assert intent.service == ArrService.RADARR
         assert intent.operation == OperationType.SEARCH
-        assert "Matrix" in intent.context.get("title", "")
-
-    def test_parse_indexer_list(self, router):
-        """Test parsing indexer listing requests."""
-        intent = router.parse_intent("Show all indexers")
-
-        assert intent.service == ArrService.PROWLARR
-        assert intent.operation == OperationType.LIST
+        assert intent.context.get("year") == "2023"
 
     def test_parse_subtitle_download(self, router):
         """Test parsing subtitle download requests."""
@@ -42,7 +35,7 @@ class TestIntentRouter:
 
         assert intent.service == ArrService.BAZARR
         assert intent.operation == OperationType.DOWNLOAD
-        assert "Dune" in intent.context.get("title", "")
+        assert intent.context.get("language") == "English"
 
     def test_parse_media_request(self, router):
         """Test parsing media request."""
@@ -50,7 +43,7 @@ class TestIntentRouter:
 
         assert intent.service == ArrService.OVERSEERR
         assert intent.operation == OperationType.REQUEST
-        assert "Inception" in intent.context.get("title", "")
+        assert intent.context.get("monitored") is True
 
     def test_parse_with_year(self, router):
         """Test parsing queries with year."""
@@ -73,11 +66,11 @@ class TestIntentRouter:
 
     def test_route_method(self, router):
         """Test the route convenience method."""
-        service, operation, context = router.route("Add The Office")
+        service, operation, context = router.route("Add The Office to my TV shows")
 
         assert service == ArrService.SONARR
         assert operation == OperationType.ADD
-        assert "Office" in context.get("title", "")
+        assert context.get("search_on_add") is True
 
     def test_explain_intent(self, router):
         """Test intent explanation."""

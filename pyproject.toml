@@ -3,66 +3,67 @@ requires = ["setuptools>=68.0.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "arr-suite-mcp"
-version = "1.0.0"
-description = "Intelligent MCP server for Plex and the complete *arr media automation suite (Sonarr, Radarr, Prowlarr, Bazarr, Overseerr)"
+name = "mcp-arr"
+version = "1.1.0"
+description = "Curated MCP server for Sonarr, Radarr, and Prowlarr on self-hosted media stacks"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
-    { name = "Arr Suite MCP Contributors" }
+    { name = "Dana Uld" }
 ]
-keywords = ["mcp", "sonarr", "radarr", "prowlarr", "bazarr", "overseerr", "media", "automation"]
+keywords = ["mcp", "sonarr", "radarr", "prowlarr", "media", "automation"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 
 dependencies = [
-    "mcp>=1.0.0",
-    "httpx>=0.27.0",
-    "pydantic>=2.0.0",
-    "pydantic-settings>=2.0.0",
-    "python-dotenv>=1.0.0",
+    "mcp==1.27.0",
+    "httpx==0.28.1",
+    "pydantic==2.13.1",
+    "pydantic-settings==2.13.1",
+    "python-dotenv==1.2.2",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "black>=24.0.0",
-    "ruff>=0.3.0",
-    "mypy>=1.8.0",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "pytest-cov==7.1.0",
+    "black==26.3.1",
+    "ruff==0.15.10",
+    "mypy==1.20.1",
 ]
 
 [project.scripts]
+arr-mcp = "arr_suite_mcp.server:main"
 arr-suite-mcp = "arr_suite_mcp.server:main"
+arr-mcp-healthcheck = "arr_suite_mcp.healthcheck:main"
 
 [project.urls]
-Homepage = "https://github.com/shaktech786/arr-suite-mcp-server"
-Documentation = "https://github.com/shaktech786/arr-suite-mcp-server#readme"
-Repository = "https://github.com/shaktech786/arr-suite-mcp-server"
-Issues = "https://github.com/shaktech786/arr-suite-mcp-server/issues"
+Homepage = "https://github.com/danauld/mcp-arr"
+Documentation = "https://github.com/danauld/mcp-arr#readme"
+Repository = "https://github.com/danauld/mcp-arr"
+Issues = "https://github.com/danauld/mcp-arr/issues"
 
-[tool.setuptools]
-packages = ["arr_suite_mcp"]
+[tool.setuptools.packages.find]
+include = ["arr_suite_mcp*"]
 
 [tool.black]
 line-length = 100
-target-version = ['py310']
+target-version = ['py311']
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py311"
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

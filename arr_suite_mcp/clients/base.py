@@ -1,9 +1,10 @@
 """Base API client for arr services."""
 
+from abc import ABC, abstractmethod
 import logging
 from typing import Any, Optional
+
 import httpx
-from abc import ABC, abstractmethod
 
 
 logger = logging.getLogger(__name__)
@@ -11,7 +12,18 @@ logger = logging.getLogger(__name__)
 
 class ArrClientError(Exception):
     """Base exception for arr client errors."""
-    pass
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        http_status: Optional[int] = None,
+        details: Optional[dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.http_status = http_status
+        self.details = details or {}
 
 
 class ArrClientConnectionError(ArrClientError):
@@ -74,6 +86,22 @@ class BaseArrClient(ABC):
         endpoint = endpoint.lstrip("/")
         return f"{self.base_url}/api/{self._api_version}/{endpoint}"
 
+    @staticmethod
+    def _response_details(response: httpx.Response) -> dict[str, Any]:
+        """Extract a structured error payload from an HTTP response."""
+        details: dict[str, Any] = {
+            "url": str(response.request.url),
+            "method": response.request.method,
+        }
+        if not response.content:
+            return details
+
+        try:
+            details["response"] = response.json()
+        except ValueError:
+            details["response"] = response.text
+        return details
+
     async def _request(
         self,
         method: str,
@@ -116,15 +144,21 @@ class BaseArrClient(ABC):
 
             if response.status_code == 401:
                 raise ArrClientAuthError(
-                    f"{self.service_name}: Authentication failed. Check your API key."
+                    "Authentication failed. Check your API key.",
+                    http_status=401,
+                    details=self._response_details(response),
                 )
             elif response.status_code == 404:
                 raise ArrClientNotFoundError(
-                    f"{self.service_name}: Resource not found at {endpoint}"
+                    f"Resource not found at {endpoint}",
+                    http_status=404,
+                    details=self._response_details(response),
                 )
             elif response.status_code >= 400:
                 raise ArrClientError(
-                    f"{self.service_name}: HTTP {response.status_code} - {response.text}"
+                    f"HTTP {response.status_code} while calling {endpoint}",
+                    http_status=response.status_code,
+                    details=self._response_details(response),
                 )
 
             response.raise_for_status()
@@ -145,11 +179,13 @@ class BaseArrClient(ABC):
                     method, endpoint, params, json, retry_count + 1
                 )
             raise ArrClientConnectionError(
-                f"{self.service_name}: Could not connect to {self.base_url}"
+                f"Could not connect to {self.base_url}",
+                details={"base_url": self.base_url, "endpoint": endpoint},
             ) from e
         except httpx.TimeoutException as e:
             raise ArrClientConnectionError(
-                f"{self.service_name}: Request timed out after {self.timeout}s"
+                f"Request timed out after {self.timeout}s",
+                details={"base_url": self.base_url, "endpoint": endpoint},
             ) from e
 
     async def get(

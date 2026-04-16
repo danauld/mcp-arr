@@ -7,6 +7,11 @@ from .base import BaseArrClient
 class ProwlarrClient(BaseArrClient):
     """Client for interacting with Prowlarr API."""
 
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize the client with the correct API version for Prowlarr."""
+        super().__init__(*args, **kwargs)
+        self._api_version = "v1"
+
     @property
     def service_name(self) -> str:
         return "Prowlarr"
@@ -97,14 +102,14 @@ class ProwlarrClient(BaseArrClient):
         """Sync indexers to a specific application."""
         return await self.post(
             "command",
-            json={"name": "ApplicationSync", "applicationId": app_id}
+            json={"name": "ApplicationIndexerSync", "applicationId": app_id}
         )
 
     async def sync_all_applications(self) -> dict[str, Any]:
         """Sync indexers to all applications."""
         return await self.post(
             "command",
-            json={"name": "ApplicationSync"}
+            json={"name": "ApplicationIndexerSync"}
         )
 
     # Tags
@@ -145,6 +150,10 @@ class ProwlarrClient(BaseArrClient):
     async def get_download_clients(self) -> list[dict[str, Any]]:
         """Get all configured download clients."""
         return await self.get("downloadclient")
+
+    async def get_system_health(self) -> list[dict[str, Any]]:
+        """Get health warnings and status details."""
+        return await self.get("health")
 
     async def add_download_client(
         self,

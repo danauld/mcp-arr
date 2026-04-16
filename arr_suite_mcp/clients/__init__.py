@@ -1,4 +1,4 @@
-"""API clients for arr services."""
+"""API clients for the curated Arr service set."""
 
 from .base import (
     BaseArrClient,
@@ -10,9 +10,6 @@ from .base import (
 from .sonarr import SonarrClient
 from .radarr import RadarrClient
 from .prowlarr import ProwlarrClient
-from .bazarr import BazarrClient
-from .overseerr import OverseerrClient
-from .plex import PlexClient
 
 __all__ = [
     "BaseArrClient",
@@ -23,7 +20,4 @@ __all__ = [
     "SonarrClient",
     "RadarrClient",
     "ProwlarrClient",
-    "BazarrClient",
-    "OverseerrClient",
-    "PlexClient",
 ]
