@@ -269,17 +269,41 @@ class SonarrClient(BaseArrClient):
         self,
         guid: str,
         indexer_id: int,
+        *,
+        should_override: bool = False,
+        episode_ids: Optional[list[int]] = None,
+        season_number: Optional[int] = None,
+        series_id: Optional[int] = None,
+        quality: Optional[dict[str, Any]] = None,
+        languages: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         """
         Manually grab (i.e. push to the download client) a specific release.
 
         `guid` and `indexer_id` come from a prior interactive_search row.
         This is the same action as clicking a manual-download row in the UI.
+
+        When ``should_override`` is True, any supplied override fields are sent
+        to Sonarr's "Override and add to Download Queue" path — this force-maps
+        the release to the provided episode/season/series/quality/languages
+        regardless of what Sonarr's parser inferred from the filename. Useful
+        for scene-numbering mismatches (e.g. SpaZe AEW releases where `342`
+        is parsed as S3E42).
         """
-        return await self.post(
-            "release",
-            json={"guid": guid, "indexerId": indexer_id},
-        )
+        payload: dict[str, Any] = {"guid": guid, "indexerId": indexer_id}
+        if should_override:
+            payload["shouldOverride"] = True
+            if episode_ids is not None:
+                payload["episodeIds"] = episode_ids
+            if season_number is not None:
+                payload["seasonNumber"] = season_number
+            if series_id is not None:
+                payload["seriesId"] = series_id
+            if quality is not None:
+                payload["quality"] = quality
+            if languages is not None:
+                payload["languages"] = languages
+        return await self.post("release", json=payload)
 
     # Generic command trigger (covers EpisodeSearch, SeasonSearch, SeriesSearch,
     # RefreshSeries, Rescan, RenameSeries, RssSync, MissingEpisodeSearch, etc.)
@@ -344,3 +368,97 @@ class SonarrClient(BaseArrClient):
         """
         payload = {**payload, "id": profile_id}
         return await self.put(f"qualityprofile/{profile_id}", json=payload)
+
+    # Indexers
+    async def get_all_indexers(self) -> list[dict[str, Any]]:
+        """List all indexers configured in Sonarr (includes Prowlarr-synced entries suffixed '(Prowlarr)')."""
+        return await self.get("indexer")
+
+    async def delete_indexer(self, indexer_id: int) -> Any:
+        """Delete an indexer. Does not affect Prowlarr; Prowlarr-synced indexers reappear on next sync."""
+        return await self.delete(f"indexer/{indexer_id}")
+
+    # Blocklist
+    async def get_blocklist(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        sort_key: str = "date",
+        sort_direction: str = "descending",
+    ) -> dict[str, Any]:
+        """Paginated list of blocklisted releases."""
+        return await self.get(
+            "blocklist",
+            params={
+                "page": page,
+                "pageSize": page_size,
+                "sortKey": sort_key,
+                "sortDirection": sort_direction,
+            },
+        )
+
+    async def delete_blocklist_item(self, blocklist_id: int) -> Any:
+        """Remove a single entry from the blocklist."""
+        return await self.delete(f"blocklist/{blocklist_id}")
+
+    async def delete_blocklist_bulk(self, blocklist_ids: list[int]) -> Any:
+        """Remove many blocklist entries in one call."""
+        return await self.delete("blocklist/bulk", json={"ids": blocklist_ids})
+
+    # Release Profiles
+    async def get_release_profiles(self) -> list[dict[str, Any]]:
+        return await self.get("releaseprofile")
+
+    async def create_release_profile(self, payload: dict[str, Any]) -> dict[str, Any]:
+        return await self.post("releaseprofile", json=payload)
+
+    async def update_release_profile(
+        self,
+        profile_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = {**payload, "id": profile_id}
+        return await self.put(f"releaseprofile/{profile_id}", json=payload)
+
+    async def delete_release_profile(self, profile_id: int) -> Any:
+        return await self.delete(f"releaseprofile/{profile_id}")
+
+    # Manual import
+    async def get_manual_import_candidates(
+        self,
+        folder: Optional[str] = None,
+        download_id: Optional[str] = None,
+        series_id: Optional[int] = None,
+        filter_existing_files: bool = True,
+    ) -> list[dict[str, Any]]:
+        """
+        Get import candidates for a folder or download. Returns files with
+        Sonarr's best-guess episode mapping, quality, language, and rejection
+        reasons — review before triggering an actual import.
+        """
+        params: dict[str, Any] = {
+            "filterExistingFiles": "true" if filter_existing_files else "false",
+        }
+        if folder is not None:
+            params["folder"] = folder
+        if download_id is not None:
+            params["downloadId"] = download_id
+        if series_id is not None:
+            params["seriesId"] = series_id
+        return await self.get("manualimport", params=params)
+
+    async def execute_manual_import(
+        self,
+        files: list[dict[str, Any]],
+        import_mode: str = "auto",
+    ) -> dict[str, Any]:
+        """
+        Import specific files (typically from a prior get_manual_import_candidates).
+
+        Each file entry must include path, seriesId, episodeIds, quality, languages.
+        import_mode is one of 'auto', 'move', 'copy'.
+        """
+        return await self.post(
+            "command",
+            json={"name": "ManualImport", "files": files, "importMode": import_mode},
+        )

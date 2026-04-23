@@ -297,3 +297,36 @@ class RadarrClient(BaseArrClient):
     ) -> dict[str, Any]:
         """Test a notification configuration."""
         return await self.post("notification/test", json=notification_data)
+
+    # Indexers
+    async def get_all_indexers(self) -> list[dict[str, Any]]:
+        """List all indexers configured directly in Radarr."""
+        return await self.get("indexer")
+
+    async def delete_indexer(self, indexer_id: int) -> Any:
+        """Delete an indexer. Prowlarr-synced entries re-appear on next sync."""
+        return await self.delete(f"indexer/{indexer_id}")
+
+    # Blocklist
+    async def get_blocklist(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        sort_key: str = "date",
+        sort_direction: str = "descending",
+    ) -> dict[str, Any]:
+        return await self.get(
+            "blocklist",
+            params={
+                "page": page,
+                "pageSize": page_size,
+                "sortKey": sort_key,
+                "sortDirection": sort_direction,
+            },
+        )
+
+    async def delete_blocklist_item(self, blocklist_id: int) -> Any:
+        return await self.delete(f"blocklist/{blocklist_id}")
+
+    async def delete_blocklist_bulk(self, blocklist_ids: list[int]) -> Any:
+        return await self.delete("blocklist/bulk", json={"ids": blocklist_ids})

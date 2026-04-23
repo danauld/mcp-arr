@@ -215,10 +215,11 @@ class BaseArrClient(ABC):
     async def delete(
         self,
         endpoint: str,
-        params: Optional[dict[str, Any]] = None
+        params: Optional[dict[str, Any]] = None,
+        json: Optional[dict[str, Any]] = None,
     ) -> Any:
-        """Make a DELETE request."""
-        return await self._request("DELETE", endpoint, params=params)
+        """Make a DELETE request. Accepts an optional JSON body for endpoints like /blocklist/bulk."""
+        return await self._request("DELETE", endpoint, params=params, json=json)
 
     async def test_connection(self) -> bool:
         """

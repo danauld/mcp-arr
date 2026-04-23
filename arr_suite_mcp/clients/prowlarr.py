@@ -45,6 +45,23 @@ class ProwlarrClient(BaseArrClient):
         """Test all configured indexers."""
         return await self.post("indexer/testall")
 
+    async def get_indexer_schema(
+        self,
+        definition_name: Optional[str] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Indexer definition templates (Cardigann/Newznab/Torznab) used to build
+        add_indexer payloads. Unfiltered response can be 600+ entries — pass
+        definition_name (e.g. 'xwtorrents', 'iptorrents') to narrow down.
+        """
+        all_schemas = await self.get("indexer/schema")
+        if definition_name is None:
+            return all_schemas
+        return [
+            s for s in all_schemas
+            if s.get("definitionName") == definition_name
+        ]
+
     # Search
     async def search(
         self,

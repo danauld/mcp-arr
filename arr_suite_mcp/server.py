@@ -22,6 +22,36 @@ logger = logging.getLogger(__name__)
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[Any]]
 
+_SECRET_FIELD_NAMES = {"password", "cookie", "apikey", "passkey", "token", "secret"}
+_REDACTED = "***REDACTED***"
+
+
+def _redact_indexer_secrets(obj: Any) -> Any:
+    """Walk a Prowlarr indexer/schema structure and redact `fields[].value` where
+    the field's name matches a known secret.
+
+    Prowlarr returns indexer configs as `{..., "fields": [{"name": "password", "value": "..."}, ...]}`.
+    We redact only values whose accompanying `name` is in the secret list — leaving the
+    rest of the structure intact so the caller can still see baseUrl, definitionName, etc.
+    """
+    if isinstance(obj, list):
+        return [_redact_indexer_secrets(x) for x in obj]
+    if isinstance(obj, dict):
+        result: dict[str, Any] = {}
+        for k, v in obj.items():
+            if k == "fields" and isinstance(v, list):
+                redacted_fields = []
+                for f in v:
+                    if isinstance(f, dict) and f.get("name") in _SECRET_FIELD_NAMES and "value" in f:
+                        redacted_fields.append({**f, "value": _REDACTED})
+                    else:
+                        redacted_fields.append(_redact_indexer_secrets(f))
+                result[k] = redacted_fields
+            else:
+                result[k] = _redact_indexer_secrets(v)
+        return result
+    return obj
+
 
 @dataclass(slots=True)
 class ToolSpec:
@@ -384,12 +414,18 @@ class ArrSuiteMCPServer:
 
         self._add_tool(
             "sonarr_grab_release",
-            "Manually grab a specific release (push it to the download client). Use after sonarr_interactive_search picks the row you want.",
+            "Manually grab a specific release (push it to the download client). Use after sonarr_interactive_search picks the row you want. Set should_override=true to force-map the release to specific episodes/season/quality/languages when Sonarr's parser guessed wrong (e.g. SpaZe AEW releases whose `342` is parsed as S3E42). Language ids: English=1, French=2, Spanish=3, German=4, Italian=5, Danish=6, Dutch=7, Japanese=8 (see Sonarr's internal language table for others).",
             {
                 "type": "object",
                 "properties": {
                     "guid": {"type": "string", "description": "Release guid from sonarr_interactive_search"},
                     "indexer_id": {"type": "integer", "description": "Indexer id from the same release row"},
+                    "should_override": {"type": "boolean", "default": False, "description": "If true, apply the override fields below (mirrors the UI's 'Override and add to Download Queue' action)"},
+                    "episode_ids": {"type": "array", "items": {"type": "integer"}, "description": "Force-map to these episode ids (use sonarr_get_episodes to look them up)"},
+                    "season_number": {"type": "integer", "description": "Season number — used for season-pack grabs"},
+                    "series_id": {"type": "integer", "description": "Series id — for rare cross-series overrides"},
+                    "quality": {"type": "object", "description": "Quality object, e.g. {quality: {id: 3}, revision: {version: 1, real: 0, isRepack: false}}"},
+                    "languages": {"type": "array", "items": {"type": "object"}, "description": "Language objects, e.g. [{id: 1}] for English"},
                 },
                 "required": ["guid", "indexer_id"],
             },
@@ -457,6 +493,167 @@ class ArrSuiteMCPServer:
             self._tool_sonarr_update_quality_profile,
             service="sonarr",
             operation="update_quality_profile",
+        )
+
+        # --- Indexers ----------------------------------------------------------
+        self._add_tool(
+            "sonarr_list_indexers",
+            "List all indexers configured in Sonarr. Includes Prowlarr-synced entries (names suffixed '(Prowlarr)') and any standalone indexers added directly (raw RSS, custom Newznab, etc.).",
+            {"type": "object", "properties": {}},
+            self._tool_sonarr_list_indexers,
+            service="sonarr",
+            operation="list_indexers",
+        )
+
+        self._add_tool(
+            "sonarr_delete_indexer",
+            "Delete an indexer from Sonarr by id. Prowlarr-synced indexers will be re-added on next sync unless removed from Prowlarr first.",
+            {
+                "type": "object",
+                "properties": {
+                    "indexer_id": {"type": "integer", "description": "Sonarr indexer id"},
+                },
+                "required": ["indexer_id"],
+            },
+            self._tool_sonarr_delete_indexer,
+            service="sonarr",
+            operation="delete_indexer",
+        )
+
+        # --- Blocklist ---------------------------------------------------------
+        self._add_tool(
+            "sonarr_get_blocklist",
+            "List blocklisted releases, paginated.",
+            {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "default": 1},
+                    "page_size": {"type": "integer", "default": 20},
+                    "sort_key": {"type": "string", "default": "date"},
+                    "sort_direction": {"type": "string", "default": "descending"},
+                },
+            },
+            self._tool_sonarr_get_blocklist,
+            service="sonarr",
+            operation="get_blocklist",
+        )
+
+        self._add_tool(
+            "sonarr_delete_blocklist_item",
+            "Remove a single entry from Sonarr's blocklist by id. Use to undo an accidental blocklist during queue cleanup.",
+            {
+                "type": "object",
+                "properties": {
+                    "blocklist_id": {"type": "integer"},
+                },
+                "required": ["blocklist_id"],
+            },
+            self._tool_sonarr_delete_blocklist_item,
+            service="sonarr",
+            operation="delete_blocklist_item",
+        )
+
+        self._add_tool(
+            "sonarr_delete_blocklist_bulk",
+            "Remove multiple entries from Sonarr's blocklist by id. Pass ids=[] to clear the entire blocklist.",
+            {
+                "type": "object",
+                "properties": {
+                    "blocklist_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["blocklist_ids"],
+            },
+            self._tool_sonarr_delete_blocklist_bulk,
+            service="sonarr",
+            operation="delete_blocklist_bulk",
+        )
+
+        # --- Release Profiles --------------------------------------------------
+        self._add_tool(
+            "sonarr_list_release_profiles",
+            "List all release profiles (preferred/ignored/required terms, indexer filters, tag scopes).",
+            {"type": "object", "properties": {}},
+            self._tool_sonarr_list_release_profiles,
+            service="sonarr",
+            operation="list_release_profiles",
+        )
+
+        self._add_tool(
+            "sonarr_create_release_profile",
+            "Create a release profile. Payload shape: {name, enabled, required:[], ignored:[], preferred:[{term, score}], includePreferredWhenRenaming, indexerId (0=all), tags:[]}. Use to implement 'prefer HEEL over SpaZe' style rules.",
+            {
+                "type": "object",
+                "properties": {
+                    "payload": {"type": "object", "description": "Release profile payload per Sonarr v3 /releaseprofile POST schema"},
+                },
+                "required": ["payload"],
+            },
+            self._tool_sonarr_create_release_profile,
+            service="sonarr",
+            operation="create_release_profile",
+        )
+
+        self._add_tool(
+            "sonarr_update_release_profile",
+            "Update an existing release profile. Typical flow: sonarr_list_release_profiles → pick one → modify → pass the full object here.",
+            {
+                "type": "object",
+                "properties": {
+                    "profile_id": {"type": "integer"},
+                    "payload": {"type": "object"},
+                },
+                "required": ["profile_id", "payload"],
+            },
+            self._tool_sonarr_update_release_profile,
+            service="sonarr",
+            operation="update_release_profile",
+        )
+
+        self._add_tool(
+            "sonarr_delete_release_profile",
+            "Delete a release profile by id.",
+            {
+                "type": "object",
+                "properties": {"profile_id": {"type": "integer"}},
+                "required": ["profile_id"],
+            },
+            self._tool_sonarr_delete_release_profile,
+            service="sonarr",
+            operation="delete_release_profile",
+        )
+
+        # --- Manual import -----------------------------------------------------
+        self._add_tool(
+            "sonarr_get_manual_import_candidates",
+            "List import candidates for a folder or download. Returns files with Sonarr's best-guess episode mapping, quality, language, and rejection reasons — review before calling sonarr_execute_manual_import.",
+            {
+                "type": "object",
+                "properties": {
+                    "folder": {"type": "string", "description": "Absolute folder path"},
+                    "download_id": {"type": "string", "description": "Download client id"},
+                    "series_id": {"type": "integer"},
+                    "filter_existing_files": {"type": "boolean", "default": True},
+                },
+            },
+            self._tool_sonarr_get_manual_import_candidates,
+            service="sonarr",
+            operation="get_manual_import_candidates",
+        )
+
+        self._add_tool(
+            "sonarr_execute_manual_import",
+            "Import specific files into the library. Each file entry must include {path, seriesId, episodeIds, quality, languages}. import_mode is 'auto' | 'move' | 'copy'.",
+            {
+                "type": "object",
+                "properties": {
+                    "files": {"type": "array", "items": {"type": "object"}},
+                    "import_mode": {"type": "string", "default": "auto"},
+                },
+                "required": ["files"],
+            },
+            self._tool_sonarr_execute_manual_import,
+            service="sonarr",
+            operation="execute_manual_import",
         )
 
     def _register_radarr_tools(self) -> None:
@@ -620,6 +817,72 @@ class ArrSuiteMCPServer:
             operation="update_movie",
         )
 
+        # --- Indexers ----------------------------------------------------------
+        self._add_tool(
+            "radarr_list_indexers",
+            "List all indexers configured in Radarr (includes Prowlarr-synced entries).",
+            {"type": "object", "properties": {}},
+            self._tool_radarr_list_indexers,
+            service="radarr",
+            operation="list_indexers",
+        )
+        self._add_tool(
+            "radarr_delete_indexer",
+            "Delete an indexer from Radarr by id. Prowlarr-synced indexers re-appear on next sync unless removed from Prowlarr first.",
+            {
+                "type": "object",
+                "properties": {"indexer_id": {"type": "integer"}},
+                "required": ["indexer_id"],
+            },
+            self._tool_radarr_delete_indexer,
+            service="radarr",
+            operation="delete_indexer",
+        )
+
+        # --- Blocklist ---------------------------------------------------------
+        self._add_tool(
+            "radarr_get_blocklist",
+            "List blocklisted movie releases, paginated.",
+            {
+                "type": "object",
+                "properties": {
+                    "page": {"type": "integer", "default": 1},
+                    "page_size": {"type": "integer", "default": 20},
+                    "sort_key": {"type": "string", "default": "date"},
+                    "sort_direction": {"type": "string", "default": "descending"},
+                },
+            },
+            self._tool_radarr_get_blocklist,
+            service="radarr",
+            operation="get_blocklist",
+        )
+        self._add_tool(
+            "radarr_delete_blocklist_item",
+            "Remove a single entry from Radarr's blocklist by id.",
+            {
+                "type": "object",
+                "properties": {"blocklist_id": {"type": "integer"}},
+                "required": ["blocklist_id"],
+            },
+            self._tool_radarr_delete_blocklist_item,
+            service="radarr",
+            operation="delete_blocklist_item",
+        )
+        self._add_tool(
+            "radarr_delete_blocklist_bulk",
+            "Remove multiple entries from Radarr's blocklist. Pass ids=[] to clear the blocklist.",
+            {
+                "type": "object",
+                "properties": {
+                    "blocklist_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["blocklist_ids"],
+            },
+            self._tool_radarr_delete_blocklist_bulk,
+            service="radarr",
+            operation="delete_blocklist_bulk",
+        )
+
     def _register_prowlarr_tools(self) -> None:
         """Register Prowlarr tools."""
         self._add_tool(
@@ -643,11 +906,75 @@ class ArrSuiteMCPServer:
         )
         self._add_tool(
             "prowlarr_get_indexers",
-            "Get all configured Prowlarr indexers.",
-            {"type": "object", "properties": {}},
+            "List all configured Prowlarr indexers. Secret field values (password, cookie, apikey, passkey, token, secret) are redacted by default — pass include_secrets=true to see them raw.",
+            {
+                "type": "object",
+                "properties": {
+                    "include_secrets": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "If true, return credential fields unredacted",
+                    },
+                },
+            },
             self._tool_prowlarr_get_indexers,
             service="prowlarr",
             operation="get_indexers",
+        )
+        self._add_tool(
+            "prowlarr_get_indexer_schema",
+            "Get indexer definition templates (Cardigann/Newznab/Torznab). Required to build an add_indexer payload. Pass definition_name (e.g. 'xwtorrents') to filter; unfiltered response can be 600+ entries.",
+            {
+                "type": "object",
+                "properties": {
+                    "definition_name": {"type": "string", "description": "Filter to this indexer, e.g. 'xwtorrents'"},
+                    "include_secrets": {"type": "boolean", "default": False},
+                },
+            },
+            self._tool_prowlarr_get_indexer_schema,
+            service="prowlarr",
+            operation="get_indexer_schema",
+        )
+        self._add_tool(
+            "prowlarr_add_indexer",
+            "Add a new indexer to Prowlarr. Use prowlarr_get_indexer_schema(definition_name) first to get the template, fill in fields (credentials, baseUrl, etc.), then pass the full payload here.",
+            {
+                "type": "object",
+                "properties": {
+                    "payload": {"type": "object", "description": "Full indexer payload"},
+                },
+                "required": ["payload"],
+            },
+            self._tool_prowlarr_add_indexer,
+            service="prowlarr",
+            operation="add_indexer",
+        )
+        self._add_tool(
+            "prowlarr_update_indexer",
+            "Update an existing Prowlarr indexer. Typical flow: prowlarr_get_indexers(include_secrets=true) → pick one → modify → pass full object.",
+            {
+                "type": "object",
+                "properties": {
+                    "indexer_id": {"type": "integer"},
+                    "payload": {"type": "object"},
+                },
+                "required": ["indexer_id", "payload"],
+            },
+            self._tool_prowlarr_update_indexer,
+            service="prowlarr",
+            operation="update_indexer",
+        )
+        self._add_tool(
+            "prowlarr_delete_indexer",
+            "Delete a Prowlarr indexer by id. This also removes it from synced downstream apps (Sonarr/Radarr) on their next sync.",
+            {
+                "type": "object",
+                "properties": {"indexer_id": {"type": "integer"}},
+                "required": ["indexer_id"],
+            },
+            self._tool_prowlarr_delete_indexer,
+            service="prowlarr",
+            operation="delete_indexer",
         )
         self._add_tool(
             "prowlarr_sync_apps",
@@ -1034,7 +1361,36 @@ class ArrSuiteMCPServer:
     async def _tool_sonarr_grab_release(self, arguments: dict[str, Any]) -> Any:
         guid = self._require_string(arguments, "guid")
         indexer_id = int(self._require(arguments, "indexer_id"))
-        return await self._get_sonarr().grab_release(guid=guid, indexer_id=indexer_id)
+        should_override = bool(arguments.get("should_override", False))
+        episode_ids = arguments.get("episode_ids")
+        if episode_ids is not None:
+            episode_ids = [int(x) for x in episode_ids]
+        season_number = arguments.get("season_number")
+        if season_number is not None:
+            season_number = int(season_number)
+        series_id = arguments.get("series_id")
+        if series_id is not None:
+            series_id = int(series_id)
+        quality = arguments.get("quality")
+        if quality is not None and not isinstance(quality, dict):
+            raise ToolInvocationError(
+                "quality must be an object", service="sonarr", operation="grab_release"
+            )
+        languages = arguments.get("languages")
+        if languages is not None and not isinstance(languages, list):
+            raise ToolInvocationError(
+                "languages must be an array", service="sonarr", operation="grab_release"
+            )
+        return await self._get_sonarr().grab_release(
+            guid=guid,
+            indexer_id=indexer_id,
+            should_override=should_override,
+            episode_ids=episode_ids,
+            season_number=season_number,
+            series_id=series_id,
+            quality=quality,
+            languages=languages,
+        )
 
     async def _tool_sonarr_get_custom_formats(self, _: dict[str, Any]) -> Any:
         return await self._get_sonarr().get_custom_formats()
@@ -1052,6 +1408,75 @@ class ArrSuiteMCPServer:
         profile_id = int(self._require(arguments, "profile_id"))
         payload = self._require_object(arguments, "payload")
         return await self._get_sonarr().update_quality_profile(profile_id, payload)
+
+    async def _tool_sonarr_list_indexers(self, _: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_all_indexers()
+
+    async def _tool_sonarr_delete_indexer(self, arguments: dict[str, Any]) -> Any:
+        indexer_id = int(self._require(arguments, "indexer_id"))
+        await self._get_sonarr().delete_indexer(indexer_id)
+        return {"deleted": True, "indexer_id": indexer_id}
+
+    async def _tool_sonarr_get_blocklist(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_blocklist(
+            page=int(arguments.get("page", 1)),
+            page_size=int(arguments.get("page_size", 20)),
+            sort_key=arguments.get("sort_key", "date"),
+            sort_direction=arguments.get("sort_direction", "descending"),
+        )
+
+    async def _tool_sonarr_delete_blocklist_item(self, arguments: dict[str, Any]) -> Any:
+        blocklist_id = int(self._require(arguments, "blocklist_id"))
+        await self._get_sonarr().delete_blocklist_item(blocklist_id)
+        return {"deleted": True, "blocklist_id": blocklist_id}
+
+    async def _tool_sonarr_delete_blocklist_bulk(self, arguments: dict[str, Any]) -> Any:
+        ids = arguments.get("blocklist_ids")
+        if not isinstance(ids, list):
+            raise ToolInvocationError(
+                "blocklist_ids must be an array",
+                service="sonarr",
+                operation="delete_blocklist_bulk",
+            )
+        ids = [int(x) for x in ids]
+        await self._get_sonarr().delete_blocklist_bulk(ids)
+        return {"deleted": True, "count": len(ids)}
+
+    async def _tool_sonarr_list_release_profiles(self, _: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_release_profiles()
+
+    async def _tool_sonarr_create_release_profile(self, arguments: dict[str, Any]) -> Any:
+        payload = self._require_object(arguments, "payload")
+        return await self._get_sonarr().create_release_profile(payload)
+
+    async def _tool_sonarr_update_release_profile(self, arguments: dict[str, Any]) -> Any:
+        profile_id = int(self._require(arguments, "profile_id"))
+        payload = self._require_object(arguments, "payload")
+        return await self._get_sonarr().update_release_profile(profile_id, payload)
+
+    async def _tool_sonarr_delete_release_profile(self, arguments: dict[str, Any]) -> Any:
+        profile_id = int(self._require(arguments, "profile_id"))
+        await self._get_sonarr().delete_release_profile(profile_id)
+        return {"deleted": True, "profile_id": profile_id}
+
+    async def _tool_sonarr_get_manual_import_candidates(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_manual_import_candidates(
+            folder=arguments.get("folder"),
+            download_id=arguments.get("download_id"),
+            series_id=int(arguments["series_id"]) if arguments.get("series_id") is not None else None,
+            filter_existing_files=bool(arguments.get("filter_existing_files", True)),
+        )
+
+    async def _tool_sonarr_execute_manual_import(self, arguments: dict[str, Any]) -> Any:
+        files = arguments.get("files")
+        if not isinstance(files, list):
+            raise ToolInvocationError(
+                "files must be an array",
+                service="sonarr",
+                operation="execute_manual_import",
+            )
+        import_mode = arguments.get("import_mode", "auto")
+        return await self._get_sonarr().execute_manual_import(files=files, import_mode=import_mode)
 
     async def _tool_radarr_search_movie(self, arguments: dict[str, Any]) -> Any:
         return await self._get_radarr().lookup_movie(self._require_string(arguments, "term"))
@@ -1107,14 +1532,73 @@ class ArrSuiteMCPServer:
         movie.update(fields)
         return await client.update_movie(movie)
 
+    async def _tool_radarr_list_indexers(self, _: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_all_indexers()
+
+    async def _tool_radarr_delete_indexer(self, arguments: dict[str, Any]) -> Any:
+        indexer_id = int(self._require(arguments, "indexer_id"))
+        await self._get_radarr().delete_indexer(indexer_id)
+        return {"deleted": True, "indexer_id": indexer_id}
+
+    async def _tool_radarr_get_blocklist(self, arguments: dict[str, Any]) -> Any:
+        return await self._get_radarr().get_blocklist(
+            page=int(arguments.get("page", 1)),
+            page_size=int(arguments.get("page_size", 20)),
+            sort_key=arguments.get("sort_key", "date"),
+            sort_direction=arguments.get("sort_direction", "descending"),
+        )
+
+    async def _tool_radarr_delete_blocklist_item(self, arguments: dict[str, Any]) -> Any:
+        blocklist_id = int(self._require(arguments, "blocklist_id"))
+        await self._get_radarr().delete_blocklist_item(blocklist_id)
+        return {"deleted": True, "blocklist_id": blocklist_id}
+
+    async def _tool_radarr_delete_blocklist_bulk(self, arguments: dict[str, Any]) -> Any:
+        ids = arguments.get("blocklist_ids")
+        if not isinstance(ids, list):
+            raise ToolInvocationError(
+                "blocklist_ids must be an array",
+                service="radarr",
+                operation="delete_blocklist_bulk",
+            )
+        ids = [int(x) for x in ids]
+        await self._get_radarr().delete_blocklist_bulk(ids)
+        return {"deleted": True, "count": len(ids)}
+
     async def _tool_prowlarr_search(self, arguments: dict[str, Any]) -> Any:
         return await self._get_prowlarr().search(
             query=self._require_string(arguments, "query"),
             type=arguments.get("type", "search"),
         )
 
-    async def _tool_prowlarr_get_indexers(self, _: dict[str, Any]) -> Any:
-        return await self._get_prowlarr().get_all_indexers()
+    async def _tool_prowlarr_get_indexers(self, arguments: dict[str, Any]) -> Any:
+        result = await self._get_prowlarr().get_all_indexers()
+        if not bool(arguments.get("include_secrets", False)):
+            result = _redact_indexer_secrets(result)
+        return result
+
+    async def _tool_prowlarr_get_indexer_schema(self, arguments: dict[str, Any]) -> Any:
+        result = await self._get_prowlarr().get_indexer_schema(
+            definition_name=arguments.get("definition_name"),
+        )
+        if not bool(arguments.get("include_secrets", False)):
+            result = _redact_indexer_secrets(result)
+        return result
+
+    async def _tool_prowlarr_add_indexer(self, arguments: dict[str, Any]) -> Any:
+        payload = self._require_object(arguments, "payload")
+        return await self._get_prowlarr().add_indexer(payload)
+
+    async def _tool_prowlarr_update_indexer(self, arguments: dict[str, Any]) -> Any:
+        indexer_id = int(self._require(arguments, "indexer_id"))
+        payload = self._require_object(arguments, "payload")
+        payload = {**payload, "id": indexer_id}
+        return await self._get_prowlarr().update_indexer(payload)
+
+    async def _tool_prowlarr_delete_indexer(self, arguments: dict[str, Any]) -> Any:
+        indexer_id = int(self._require(arguments, "indexer_id"))
+        await self._get_prowlarr().delete_indexer(indexer_id)
+        return {"deleted": True, "indexer_id": indexer_id}
 
     async def _tool_prowlarr_sync_apps(self, _: dict[str, Any]) -> Any:
         return await self._get_prowlarr().sync_all_applications()
