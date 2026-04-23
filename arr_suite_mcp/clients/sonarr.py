@@ -238,3 +238,109 @@ class SonarrClient(BaseArrClient):
     ) -> dict[str, Any]:
         """Update configuration for a specific section."""
         return await self.put(f"config/{section}", json=config_data)
+
+    # Interactive release search + manual grab
+    # Targets: /api/v3/release (GET to list available releases, POST to grab one)
+    async def interactive_search(
+        self,
+        episode_id: Optional[int] = None,
+        series_id: Optional[int] = None,
+        season_number: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Return all available releases for an episode, season, or series search.
+
+        Exactly one of episode_id / series_id (alone or with season_number) must
+        be provided. Results include score, quality, rejection reasons, guid,
+        and indexer id — what the UI's interactive-search grid shows.
+        """
+        params: dict[str, Any] = {}
+        if episode_id is not None:
+            params["episodeId"] = episode_id
+        elif series_id is not None:
+            params["seriesId"] = series_id
+            if season_number is not None:
+                params["seasonNumber"] = season_number
+        else:
+            raise ValueError("interactive_search requires episode_id or series_id")
+        return await self.get("release", params=params)
+
+    async def grab_release(
+        self,
+        guid: str,
+        indexer_id: int,
+    ) -> dict[str, Any]:
+        """
+        Manually grab (i.e. push to the download client) a specific release.
+
+        `guid` and `indexer_id` come from a prior interactive_search row.
+        This is the same action as clicking a manual-download row in the UI.
+        """
+        return await self.post(
+            "release",
+            json={"guid": guid, "indexerId": indexer_id},
+        )
+
+    # Generic command trigger (covers EpisodeSearch, SeasonSearch, SeriesSearch,
+    # RefreshSeries, Rescan, RenameSeries, RssSync, MissingEpisodeSearch, etc.)
+    async def trigger_command(
+        self,
+        name: str,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Trigger a Sonarr command by name, passing through any extra kwargs as JSON body."""
+        payload: dict[str, Any] = {"name": name}
+        for k, v in kwargs.items():
+            if v is not None:
+                payload[k] = v
+        return await self.post("command", json=payload)
+
+    # Custom Formats
+    async def get_custom_formats(self) -> list[dict[str, Any]]:
+        """List all custom formats."""
+        return await self.get("customformat")
+
+    async def get_custom_format(self, custom_format_id: int) -> dict[str, Any]:
+        """Get a single custom format by id."""
+        return await self.get(f"customformat/{custom_format_id}")
+
+    async def create_custom_format(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """
+        Create a new custom format.
+
+        Payload shape follows Sonarr v3's /customformat POST schema:
+            {
+                "name": "...",
+                "includeCustomFormatWhenRenaming": false,
+                "specifications": [
+                    {"name": "...", "implementation": "ReleaseTitleSpecification",
+                     "negate": false, "required": false,
+                     "fields": [{"name":"value","value":"..."}]}
+                ]
+            }
+        """
+        return await self.post("customformat", json=payload)
+
+    async def update_custom_format(
+        self,
+        custom_format_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Update an existing custom format. Payload must include `id` matching the URL."""
+        payload = {**payload, "id": custom_format_id}
+        return await self.put(f"customformat/{custom_format_id}", json=payload)
+
+    async def update_quality_profile(
+        self,
+        profile_id: int,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Update an existing quality profile.
+
+        Pass the full profile object merged with edits (e.g. formatItems with
+        new scores, cutoff, minFormatScore). Use get_quality_profile first to
+        retrieve the current shape, then modify and send back.
+        """
+        payload = {**payload, "id": profile_id}
+        return await self.put(f"qualityprofile/{profile_id}", json=payload)

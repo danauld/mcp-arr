@@ -315,6 +315,150 @@ class ArrSuiteMCPServer:
             operation="update_series",
         )
 
+        # --- Queue management ---------------------------------------------------
+        self._add_tool(
+            "sonarr_delete_queue_item",
+            "Delete a single queued download in Sonarr. Setting remove_from_client=true also removes it from qBittorrent/the download client; blocklist=true prevents the same release being grabbed again. This is the one-call version of 'kill a stuck French torrent and blocklist it so it doesn't come back'.",
+            {
+                "type": "object",
+                "properties": {
+                    "queue_id": {"type": "integer", "description": "Queue item ID (from sonarr_get_queue)"},
+                    "remove_from_client": {"type": "boolean", "default": True, "description": "Also remove from the download client (qBittorrent etc.)"},
+                    "blocklist": {"type": "boolean", "default": False, "description": "Blocklist the release so Sonarr won't grab it again"},
+                },
+                "required": ["queue_id"],
+            },
+            self._tool_sonarr_delete_queue_item,
+            service="sonarr",
+            operation="delete_queue_item",
+        )
+
+        # --- Episode / series search (command trigger) --------------------------
+        self._add_tool(
+            "sonarr_search_episode",
+            "Force a search for a single episode by episode id. Triggers the EpisodeSearch command.",
+            {
+                "type": "object",
+                "properties": {
+                    "episode_id": {"type": "integer", "description": "Episode ID"},
+                },
+                "required": ["episode_id"],
+            },
+            self._tool_sonarr_search_episode,
+            service="sonarr",
+            operation="search_episode",
+        )
+
+        self._add_tool(
+            "sonarr_trigger_command",
+            "Generic Sonarr command trigger. Covers EpisodeSearch, SeasonSearch, SeriesSearch, RefreshSeries, RescanSeries, RenameSeries, RssSync, MissingEpisodeSearch, CutoffUnmetEpisodeSearch, Backup, and others. Pass the command name and any command-specific fields in `payload`.",
+            {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Sonarr command name (e.g. 'EpisodeSearch', 'RssSync', 'RefreshSeries')"},
+                    "payload": {"type": "object", "description": "Extra fields to include on the command body (e.g. {episodeIds: [1,2]}, {seriesId: 10}, {seriesIds: [10]}).", "default": {}},
+                },
+                "required": ["name"],
+            },
+            self._tool_sonarr_trigger_command,
+            service="sonarr",
+            operation="trigger_command",
+        )
+
+        # --- Interactive release search + manual grab ---------------------------
+        self._add_tool(
+            "sonarr_interactive_search",
+            "List all releases Sonarr's indexers can currently find for an episode, season, or series — the same data the UI's interactive-search grid shows. Results include score, quality, rejection reasons, guid, and indexer id. Feed a chosen row's {guid, indexer_id} to sonarr_grab_release to actually download it.",
+            {
+                "type": "object",
+                "properties": {
+                    "episode_id": {"type": "integer", "description": "Episode ID to search for"},
+                    "series_id": {"type": "integer", "description": "Series ID (use with season_number, or alone for full-series search)"},
+                    "season_number": {"type": "integer", "description": "Season number (requires series_id)"},
+                },
+            },
+            self._tool_sonarr_interactive_search,
+            service="sonarr",
+            operation="interactive_search",
+        )
+
+        self._add_tool(
+            "sonarr_grab_release",
+            "Manually grab a specific release (push it to the download client). Use after sonarr_interactive_search picks the row you want.",
+            {
+                "type": "object",
+                "properties": {
+                    "guid": {"type": "string", "description": "Release guid from sonarr_interactive_search"},
+                    "indexer_id": {"type": "integer", "description": "Indexer id from the same release row"},
+                },
+                "required": ["guid", "indexer_id"],
+            },
+            self._tool_sonarr_grab_release,
+            service="sonarr",
+            operation="grab_release",
+        )
+
+        # --- Custom Formats -----------------------------------------------------
+        self._add_tool(
+            "sonarr_get_custom_formats",
+            "List all configured custom formats with their specifications.",
+            {"type": "object", "properties": {}},
+            self._tool_sonarr_get_custom_formats,
+            service="sonarr",
+            operation="get_custom_formats",
+        )
+
+        self._add_tool(
+            "sonarr_create_custom_format",
+            "Create a new custom format. Pass the full Sonarr v3 payload (name, includeCustomFormatWhenRenaming, specifications[]).",
+            {
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "object",
+                        "description": "Full custom format payload per Sonarr v3 /customformat POST schema",
+                    },
+                },
+                "required": ["payload"],
+            },
+            self._tool_sonarr_create_custom_format,
+            service="sonarr",
+            operation="create_custom_format",
+        )
+
+        self._add_tool(
+            "sonarr_update_custom_format",
+            "Update an existing custom format. Typical flow: sonarr_get_custom_formats → pick one → modify → pass full object here.",
+            {
+                "type": "object",
+                "properties": {
+                    "custom_format_id": {"type": "integer", "description": "Custom format id"},
+                    "payload": {"type": "object", "description": "Full custom format object (merge your edits into the current shape)"},
+                },
+                "required": ["custom_format_id", "payload"],
+            },
+            self._tool_sonarr_update_custom_format,
+            service="sonarr",
+            operation="update_custom_format",
+        )
+
+        # --- Quality Profile modification --------------------------------------
+        self._add_tool(
+            "sonarr_update_quality_profile",
+            "Update a quality profile — used for adjusting format scores, cutoff, minFormatScore, language priorities. Typical flow: sonarr_get_quality_profiles → copy the profile → modify formatItems/cutoff → pass full object here.",
+            {
+                "type": "object",
+                "properties": {
+                    "profile_id": {"type": "integer", "description": "Quality profile id"},
+                    "payload": {"type": "object", "description": "Full quality profile object with your edits merged in"},
+                },
+                "required": ["profile_id", "payload"],
+            },
+            self._tool_sonarr_update_quality_profile,
+            service="sonarr",
+            operation="update_quality_profile",
+        )
+
     def _register_radarr_tools(self) -> None:
         """Register Radarr tools."""
         self._add_tool(
@@ -840,6 +984,74 @@ class ArrSuiteMCPServer:
         series = await client.get_series(series_id)
         series.update(fields)
         return await client.update_series(series)
+
+    # --- new sonarr handlers -------------------------------------------------
+
+    async def _tool_sonarr_delete_queue_item(self, arguments: dict[str, Any]) -> Any:
+        client = self._get_sonarr()
+        queue_id = int(self._require(arguments, "queue_id"))
+        await client.delete_queue_item(
+            queue_id=queue_id,
+            remove_from_client=bool(arguments.get("remove_from_client", True)),
+            blocklist=bool(arguments.get("blocklist", False)),
+        )
+        return {
+            "success": True,
+            "queue_id": queue_id,
+            "remove_from_client": bool(arguments.get("remove_from_client", True)),
+            "blocklist": bool(arguments.get("blocklist", False)),
+        }
+
+    async def _tool_sonarr_search_episode(self, arguments: dict[str, Any]) -> Any:
+        episode_id = int(self._require(arguments, "episode_id"))
+        return await self._get_sonarr().search_episode(episode_id)
+
+    async def _tool_sonarr_trigger_command(self, arguments: dict[str, Any]) -> Any:
+        name = self._require_string(arguments, "name")
+        payload = arguments.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise ToolInvocationError(
+                "payload must be an object", service="sonarr", operation="trigger_command"
+            )
+        return await self._get_sonarr().trigger_command(name, **payload)
+
+    async def _tool_sonarr_interactive_search(self, arguments: dict[str, Any]) -> Any:
+        episode_id = arguments.get("episode_id")
+        series_id = arguments.get("series_id")
+        season_number = arguments.get("season_number")
+        if episode_id is None and series_id is None:
+            raise ToolInvocationError(
+                "Provide episode_id or series_id (with optional season_number)",
+                service="sonarr",
+                operation="interactive_search",
+            )
+        return await self._get_sonarr().interactive_search(
+            episode_id=int(episode_id) if episode_id is not None else None,
+            series_id=int(series_id) if series_id is not None else None,
+            season_number=int(season_number) if season_number is not None else None,
+        )
+
+    async def _tool_sonarr_grab_release(self, arguments: dict[str, Any]) -> Any:
+        guid = self._require_string(arguments, "guid")
+        indexer_id = int(self._require(arguments, "indexer_id"))
+        return await self._get_sonarr().grab_release(guid=guid, indexer_id=indexer_id)
+
+    async def _tool_sonarr_get_custom_formats(self, _: dict[str, Any]) -> Any:
+        return await self._get_sonarr().get_custom_formats()
+
+    async def _tool_sonarr_create_custom_format(self, arguments: dict[str, Any]) -> Any:
+        payload = self._require_object(arguments, "payload")
+        return await self._get_sonarr().create_custom_format(payload)
+
+    async def _tool_sonarr_update_custom_format(self, arguments: dict[str, Any]) -> Any:
+        custom_format_id = int(self._require(arguments, "custom_format_id"))
+        payload = self._require_object(arguments, "payload")
+        return await self._get_sonarr().update_custom_format(custom_format_id, payload)
+
+    async def _tool_sonarr_update_quality_profile(self, arguments: dict[str, Any]) -> Any:
+        profile_id = int(self._require(arguments, "profile_id"))
+        payload = self._require_object(arguments, "payload")
+        return await self._get_sonarr().update_quality_profile(profile_id, payload)
 
     async def _tool_radarr_search_movie(self, arguments: dict[str, Any]) -> Any:
         return await self._get_radarr().lookup_movie(self._require_string(arguments, "term"))
